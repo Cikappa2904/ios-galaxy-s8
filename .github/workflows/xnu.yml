@@ -35,7 +35,7 @@ env:
 jobs:
   build:
     # macos-14 (Xcode 15.x, whose iig matched the xnu-8796 IORPC ABI) was retired on 2026-11-02;
-    # macos-15 has Xcode 16.0+ only: its iig emits IORPC.kernelContent (handled by a patch)
+    # macos-15 has Xcode 16.0+ only; Xcode 16.0 builds this tree (run 42106097092)
     runs-on: macos-15
     timeout-minutes: 120
     steps:
