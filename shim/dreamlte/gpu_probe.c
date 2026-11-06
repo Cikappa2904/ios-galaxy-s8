@@ -581,7 +581,9 @@ static void rp_run(void (*kv)(const char *, uint64_t), void (*out)(const char *)
 		wr(js + 0x54, 0);
 		wr(js + 0x58, (8u << 16) | (3u << 12) | (3u << 8));
 		wr(js + 0x60, 1);				/* JS_COMMAND_START */
-		uint64_t t0 = ticks(), end = t0 + TIMER_HZ / 5;	/* 200 ms */
+		/* 50 ms: a probe takes tens of us, a 64x64 suite pass a few ms;
+		 * 270 chains must not keep the loader long if many hang */
+		uint64_t t0 = ticks(), end = t0 + TIMER_HZ / 20;
 		while (ticks() < end && !(rd(MALI + JOB_IRQ_RAWSTAT) & (done | fail)))
 			;
 		uint64_t us = (ticks() - t0) / (TIMER_HZ / 1000000);
@@ -690,7 +692,9 @@ static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char 
 		if (matrix) {
 			if (matrix > 1)			/* s8gpu=3 */
 				gpu_matrix(kv, out, shaders);
-			rp_run(kv, out, shaders, 0);
+			/* 'B' record flags bit 0: page tables only (one run, as XNU) */
+			if (!(rp32(0) == 'B' && (rp32(4) & 1)))
+				rp_run(kv, out, shaders, 0);
 			rp_run(kv, out, shaders, 1);
 			mx_as(2, 0);			/* back to IDENTITY */
 		}
