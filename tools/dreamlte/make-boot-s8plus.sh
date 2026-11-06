@@ -29,11 +29,15 @@ gpu)
 	# Metal branch (s8plus-gpu) only: fast + CoreAnimation on the Mali through
 	# S8MaliMetal.bundle (S8_OVERLAY = metal/stage3.ovl; installed on the first
 	# boot, used from the second). s8mngs=0: the merged loader neither probes
-	# nor caps the Mongoose cores. s8g3d: Mali clock through ACPM.
-	export S8_DRAM_MIB=${S8_DRAM_MIB:-1024}
+	# nor caps the Mongoose cores.
+	# RAM: the GPU code uses fixed PAs right above 512 MiB (blit 0x8a0000000,
+	# heap 0x8b0000000): more RAM for XNU panics (pmap_assert_free, G955F
+	# 2026-11-06). No s8g3d: changing the G3D clock through ACPM after the
+	# Mali is set up left every job ACTIVE (present and Metal draws timed out).
+	export S8_DRAM_MIB=512
 	: "${S8_OVERLAY:?S8_OVERLAY must name the Metal overlay (stage3.ovl)}"
 	args=(cpus=8 s8mngs=0 s8cpufreq=1690000 s8cpufreq_big=2314000 "s8noexec=$noexec"
-		s8g3d=455000 sweetfb_gpu=1 s8metal=1 sweetfb_hz=30)
+		sweetfb_gpu=1 s8metal=1 sweetfb_hz=30)
 	;;
 safe)    args=(cpus=1) ;;
 notouch) args=(cpus=1 s8touch=0) ;;
