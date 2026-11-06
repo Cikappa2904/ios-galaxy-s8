@@ -189,7 +189,269 @@ static void job_header(unsigned type)
 	put32(0x10, 1u | (type << 1) | (1u << 16));	/* size 64, type, job_index 1 */
 }
 
-static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char *), uint32_t shaders)
+/*
+ * Address matrix (Galaxy S8+ G955F, 2026-11-06). The jobs above all live in
+ * low RAM (the loader image, below 4 GiB) with AS0 in IDENTITY mode, and
+ * they work. XNU's GPU code keeps its job descriptors, page tables and GPU
+ * heap in the high bank (0x8a0000000+) with AS0 in AARCH64_4K mode (the
+ * same setup as Samsung's kbase r2p0), and on the S8+ every such job stays
+ * ACTIVE with no fault. One WRITE_VALUE job per case separates the two
+ * factors: where the job/target are, where the page tables are, and the
+ * translation mode. A stuck job is hard-stopped and the GPU soft-reset and
+ * re-powered before the next case. MMU off: CPU accesses are uncached.
+ */
+#define MX_HIGH		0x8a0100000ULL	/* above XNU's 512 MiB (s8gpu=2 boots only) */
+#define MX_HIGH_PT	MX_HIGH			/* 4 tables: L0..L3 */
+#define MX_HIGH_JOB	(MX_HIGH + 0x10000)
+static volatile uint64_t mx_low_pt[4 * 512] __attribute__((aligned(4096)));
+static volatile uint8_t mx_low_job[4096] __attribute__((aligned(4096)));
+
+static inline void w32(uint64_t a, uint32_t v) { *(volatile uint32_t *)(uintptr_t)a = v; }
+static inline uint32_t r32(uint64_t a) { return *(volatile uint32_t *)(uintptr_t)a; }
+static inline void w64(uint64_t a, uint64_t v) { *(volatile uint64_t *)(uintptr_t)a = v; }
+
+static void mx_power(uint32_t shaders)
+{
+	wr(MALI + GPU_IRQ_CLEAR, 0xffffffffu);
+	wr(MALI + GPU_COMMAND, 1);			/* SOFT_RESET */
+	wait_mask(MALI + GPU_IRQ_RAWSTAT, RESET_DONE, RESET_DONE, 100);
+	wr(MALI + GPU_IRQ_CLEAR, 0xffffffffu);
+	uint32_t l2 = rd(MALI + 0x120), tiler = rd(MALI + 0x110);
+	wr(MALI + 0x1a0, l2);
+	wait_mask(MALI + 0x160, l2, l2, 100);
+	wr(MALI + 0x190, tiler);
+	wait_mask(MALI + 0x150, tiler, tiler, 100);
+	wr(MALI + 0x180, shaders);
+	wait_mask(MALI + 0x140, shaders, shaders, 100);
+}
+
+/* AS0: transcfg 2 (IDENTITY) or 6 (AARCH64_4K, table at pt), as the kernel. */
+static int mx_as(uint32_t transcfg, uint64_t pt)
+{
+	wr(MALI + AS0 + 0x00, (uint32_t)pt);
+	wr(MALI + AS0 + 0x04, (uint32_t)(pt >> 32));
+	wr(MALI + AS0 + 0x08, 0x88888888u);
+	wr(MALI + AS0 + 0x0c, 0x88888888u);
+	wr(MALI + AS0 + 0x30, transcfg);
+	wr(MALI + AS0 + 0x34, 0);
+	wr(MALI + AS0 + 0x18, 1);			/* AS_COMMAND_UPDATE */
+	return wait_mask(MALI + AS0 + 0x28, 1, 0, 100);
+}
+
+/* 4-level AArch64 4K tables at pt (4 pages), mapping the 4 KiB page of va
+ * VA = PA, entries exactly as s8_gpu_present.inc / kbase r2p0 write them. */
+static void mx_map(uint64_t pt, uint64_t va)
+{
+	for (unsigned i = 0; i < 4 * 512; i++)
+		w64(pt + i * 8, 0);
+	for (unsigned lv = 0; lv < 3; lv++) {
+		unsigned idx = (unsigned)(va >> (39 - 9 * lv)) & 511;
+		w64(pt + lv * 4096 + idx * 8, (pt + (lv + 1) * 4096) | (1ULL << 10) | 3);
+	}
+	w64(pt + 3 * 4096 + ((va >> 12) & 511) * 8,
+	    (va & 0xfffffffff000ULL) | (1ULL << 6) | (1ULL << 10) | 3);
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void mx_case(void (*kv)(const char *, uint64_t), void (*out)(const char *),
+    uint32_t shaders, const char *name, uint64_t job, uint64_t pt)
+{
+	const uint32_t magic = 0x5a5a0000u | (uint32_t)(job >> 20 & 0xffff);
+	out(name);
+	out("\n");
+	for (unsigned i = 0; i < 0x40; i += 4)
+		w32(job + i, 0);
+	w32(job + 0x10, 1u | (2u << 1) | (1u << 16));	/* 64-bit header, WRITE_VALUE */
+	w64(job + 0x20, job + 0x100);			/* target */
+	w32(job + 0x28, 6);				/* immediate 32 */
+	w64(job + 0x30, magic);
+	w32(job + 0x100, 0xdeadbeefu);
+	if (pt)
+		mx_map(pt, job);
+	kv("as0 update", mx_as(pt ? 6 : 2, pt));
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+	wr(MALI + JS0 + 0x40, (uint32_t)job);
+	wr(MALI + JS0 + 0x44, (uint32_t)(job >> 32));
+	wr(MALI + JS0 + 0x50, shaders);
+	wr(MALI + JS0 + 0x54, 0);
+	wr(MALI + JS0 + 0x58, (8u << 16) | (3u << 12) | (3u << 8));
+	wr(MALI + JS0 + 0x60, 1);
+	uint64_t end = ticks() + TIMER_HZ / 10;
+	while (ticks() < end && !(rd(MALI + JOB_IRQ_RAWSTAT) & ((1u << 16) | 1u)))
+		;
+	uint32_t irq = rd(MALI + JOB_IRQ_RAWSTAT), js = rd(MALI + JS0 + 0x24);
+	kv("irq", irq);
+	kv("js", js);
+	kv("fault", rd(MALI + AS0 + 0x1c));
+	kv("faddr", ((uint64_t)rd(MALI + AS0 + 0x24) << 32) | rd(MALI + AS0 + 0x20));
+	out("\n");
+	kv("value ok", r32(job + 0x100) == magic);
+	out("\n");
+	if (js == 0x8 || !(irq & 1u)) {		/* still ACTIVE or no DONE: recover */
+		wr(MALI + JS0 + 0x60, 3);		/* JS_COMMAND_HARD_STOP */
+		wait_mask(MALI + JOB_IRQ_RAWSTAT, (1u << 16) | 1u, (1u << 16), 50);
+		mx_power(shaders);
+	}
+	wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+}
+
+static void bl_case(void (*kv)(const char *, uint64_t), void (*out)(const char *),
+    uint32_t shaders, const char *name, int tables);
+
+static void gpu_matrix(void (*kv)(const char *, uint64_t), void (*out)(const char *), uint32_t shaders)
+{
+	uint64_t lo_job = (uintptr_t)mx_low_job, lo_pt = (uintptr_t)mx_low_pt;
+	out("GPU address matrix (job / page tables / mode)\n");
+	kv("low job", lo_job);
+	kv("low pt", lo_pt);
+	out("\n");
+	/* The image is linked at 0 and runs where S-Boot put it: the 4 KiB
+	 * alignment of the low arrays is only real if that address is aligned. */
+	int lo_ok = !(lo_pt & 0xfff) && !(lo_job & 0xfff);
+	kv("low aligned", lo_ok);
+	out("\n");
+	mx_case(kv, out, shaders, "MX B: high job, IDENTITY", MX_HIGH_JOB, 0);
+	if (lo_ok)
+		mx_case(kv, out, shaders, "MX C: low job, low pt", lo_job, lo_pt);
+	mx_case(kv, out, shaders, "MX D: high job, high pt (kernel)", MX_HIGH_JOB, MX_HIGH_PT);
+	if (lo_ok) {
+		mx_case(kv, out, shaders, "MX E: high job, low pt", MX_HIGH_JOB, lo_pt);
+		mx_case(kv, out, shaders, "MX F: low job, high pt", lo_job, MX_HIGH_PT);
+	}
+	bl_case(kv, out, shaders, "MX G: XNU present job (shader), IDENTITY", 0);
+	bl_case(kv, out, shaders, "MX H: XNU present job (shader), page tables", 1);
+	mx_as(2, 0);					/* back to IDENTITY */
+	out("GPU address matrix done\n");
+}
+
+/*
+ * Cases G/H (2026-11-06): every job the loader ran so far is fixed-function
+ * (NULL, WRITE_VALUE, a clear-only fragment job), and they all work, also
+ * with the kernel's page-table layout (case D). Every job XNU runs executes
+ * a shader (the present blit, Metal draws) and stays ACTIVE. G runs XNU's
+ * own present job (s8_mali_blit.h, byte for byte, at its fixed address)
+ * from here: a 64x64 green source stretched over the whole panel, AS0 in
+ * IDENTITY. H is the same job through page tables built as the kernel's.
+ */
+#include "../../tools/dreamlte/s8_mali_blit.h"
+
+#define BL_SRC		(S8_BLIT_BASE_PA + 0x200000)	/* 64x64 source, 256-byte rows */
+#define BL_PT		(S8_BLIT_BASE_PA + 0x400000)	/* table pool, 64 pages */
+#define BL_PT_PAGES	64u
+#define BL_PANEL_SIZE	(5760ULL * 2960)
+static unsigned bl_pt_used;
+
+static uint32_t bl_float(uint32_t v)
+{
+	if (v == 0)
+		return 0;
+	uint32_t e = 31 - (uint32_t)__builtin_clz(v);
+	uint32_t m = e > 23 ? (v >> (e - 23)) : (v << (23 - e));
+	return ((e + 127) << 23) | (m & 0x7fffff);
+}
+
+/* Same walk and entries as s8gpu_pte/s8gpu_map in s8_gpu_present.inc. */
+static int bl_map(uint64_t va, uint64_t len)
+{
+	for (uint64_t o = 0; o < len; o += 4096) {
+		unsigned table = 0;
+		for (unsigned lv = 0; lv < 3; lv++) {
+			unsigned idx = (unsigned)((va + o) >> (39 - 9 * lv)) & 511;
+			uint64_t e = BL_PT + (uint64_t)table * 4096 + idx * 8;
+			uint64_t v = *(volatile uint64_t *)(uintptr_t)e;
+			if ((v & 3) != 3) {
+				if (bl_pt_used == BL_PT_PAGES)
+					return 0;
+				table = bl_pt_used++;
+				w64(e, (BL_PT + (uint64_t)table * 4096) | (1ULL << 10) | 3);
+			} else {
+				table = (unsigned)(((v & 0xfffffffff000ULL) - BL_PT) / 4096);
+			}
+		}
+		w64(BL_PT + (uint64_t)table * 4096 + (((va + o) >> 12) & 511) * 8,
+		    ((va + o) & 0xfffffffff000ULL) | (1ULL << 6) | (1ULL << 10) | 3);
+	}
+	return 1;
+}
+
+static void bl_case(void (*kv)(const char *, uint64_t), void (*out)(const char *),
+    uint32_t shaders, const char *name, int tables)
+{
+	const uint64_t base = S8_BLIT_BASE_PA;
+	const uint32_t w = 64, h = 64, bpr = 256;
+	out(name);
+	out("\n");
+	for (unsigned i = 0; i < S8_BLIT_SIZE; i += 4) {
+		uint32_t v = (uint32_t)s8_blit_blob[i] | (uint32_t)s8_blit_blob[i + 1] << 8 |
+		    (uint32_t)s8_blit_blob[i + 2] << 16 | (uint32_t)s8_blit_blob[i + 3] << 24;
+		w32(base + i, v);
+	}
+	for (unsigned i = 0; i < h * bpr; i += 4)
+		w32(BL_SRC + i, 0xff00ff00u);		/* opaque green in BGRA and RGBA */
+	w32(base + S8_BLIT_TEX_SIZE, (w - 1) | ((h - 1) << 16));
+	w64(base + S8_BLIT_SURF_PTR, BL_SRC);
+	w32(base + S8_BLIT_SURF_STRIDE, bpr);
+	uint32_t tc = S8_BLIT_TEXCOORD, fw = bl_float(w), fh = bl_float(h);
+	w32(base + tc + 0, 0);  w32(base + tc + 4, 0);
+	w32(base + tc + 16, fw); w32(base + tc + 20, 0);
+	w32(base + tc + 32, 0);  w32(base + tc + 36, fh);
+	w32(base + tc + 48, fw); w32(base + tc + 52, fh);
+	uint64_t mid = FB_PHYS + 1480ULL * FB_STRIDE + 720 * 4;
+	w32(mid, 0xff000000u);
+	int as_ok;
+	if (tables) {
+		for (unsigned i = 0; i < BL_PT_PAGES * 512; i++)
+			w64(BL_PT + i * 8, 0);
+		bl_pt_used = 1;
+		int m = bl_map(base, S8_BLIT_SIZE) && bl_map(BL_SRC, h * bpr) &&
+		    bl_map(FB_PHYS, (BL_PANEL_SIZE + 4095) & ~4095ULL);
+		kv("mapped", m);
+		kv("pt pages", bl_pt_used);
+		__asm__ volatile("dsb sy" ::: "memory");
+		as_ok = mx_as(6, BL_PT);
+	} else {
+		as_ok = mx_as(2, 0);
+	}
+	kv("as0 update", as_ok);
+	out("\n");
+	__asm__ volatile("dsb sy" ::: "memory");
+	uint64_t job = base + S8_BLIT_JOB;
+	wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+	wr(MALI + JS0 + 0x40, (uint32_t)job);
+	wr(MALI + JS0 + 0x44, (uint32_t)(job >> 32));
+	wr(MALI + JS0 + 0x50, shaders);
+	wr(MALI + JS0 + 0x54, 0);
+	wr(MALI + JS0 + 0x58, (8u << 16) | (3u << 12) | (3u << 8));
+	wr(MALI + JS0 + 0x60, 1);
+	uint64_t end = ticks() + TIMER_HZ / 5;		/* 200 ms, as the kernel */
+	while (ticks() < end && !(rd(MALI + JOB_IRQ_RAWSTAT) & ((1u << 16) | 1u)))
+		;
+	uint32_t irq = rd(MALI + JOB_IRQ_RAWSTAT), js = rd(MALI + JS0 + 0x24);
+	kv("irq", irq);
+	kv("js", js);
+	kv("exc", r32(job));
+	kv("fault", rd(MALI + AS0 + 0x1c));
+	kv("faddr", ((uint64_t)rd(MALI + AS0 + 0x24) << 32) | rd(MALI + AS0 + 0x20));
+	out("\n");
+	kv("GPU_STATUS", rd(MALI + 0x034));
+	kv("shader ready", rd(MALI + 0x140));
+	kv("gpu irq", rd(MALI + GPU_IRQ_RAWSTAT));
+	kv("fault st", rd(MALI + 0x03c));
+	out("\n");
+	kv("mid pixel", r32(mid));
+	kv("SHADER JOB WORKS", (irq & 1u) && !(irq & (1u << 16)) && ((r32(mid) >> 8) & 0xff) == 0xff);
+	out("\n");
+	if (js == 0x8 || !(irq & 1u)) {
+		wr(MALI + JS0 + 0x60, 3);		/* HARD_STOP */
+		wait_mask(MALI + JOB_IRQ_RAWSTAT, (1u << 16) | 1u, (1u << 16), 50);
+		mx_power(shaders);
+	}
+	wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+}
+
+static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char *), uint32_t shaders,
+    int matrix)
 {
 	out("GPU jobs\n");
 	wr(MALI + GPU_IRQ_CLEAR, 0xffffffffu);
@@ -242,11 +504,14 @@ static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char 
 	out("\n");
 	kv("GPU JOB WORKS", get32(0x100) == magic);
 	out("\n");
-	if (get32(0x100) == magic)
+	if (get32(0x100) == magic) {
 		gpu_draw(kv, out, shaders);
+		if (matrix)
+			gpu_matrix(kv, out, shaders);
+	}
 }
 
-int gpu_probe(void (*kv)(const char *, uint64_t), void (*out)(const char *))
+int gpu_probe(void (*kv)(const char *, uint64_t), void (*out)(const char *), int matrix)
 {
 	out("GPU probe (Mali-G71, pd-g3d)\n");
 	kv("g3d cfg", rd(G3D_CFG));
@@ -284,7 +549,7 @@ int gpu_probe(void (*kv)(const char *, uint64_t), void (*out)(const char *))
 	kv("MALI G71 FOUND", g71);
 	out("\n");
 	if (g71)
-		gpu_jobs(kv, out, rd(MALI + 0x100));
+		gpu_jobs(kv, out, rd(MALI + 0x100), matrix);
 	out("GPU probe done\n");
 	return g71;
 }
