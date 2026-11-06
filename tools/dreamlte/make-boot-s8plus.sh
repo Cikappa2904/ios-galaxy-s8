@@ -22,7 +22,7 @@ noexec=vmd,bluetoothd,fairplayd.H2,nanotimekitcompaniond,locationd,WirelessRadio
 
 case $mode in
 fast)
-	export S8_DRAM_MIB=1024
+	export S8_DRAM_MIB=${S8_DRAM_MIB:-1024}   # the high bank holds 2048
 	args=(cpus=8 s8cpufreq=1690000 s8cpufreq_big=2314000 "s8noexec=$noexec")
 	;;
 safe)    args=(cpus=1) ;;
