@@ -1,6 +1,6 @@
 #!/bin/bash
 # Galaxy S8+ (SM-G955F) BOOT image with the boot-args tested on the phone.
-#   make-boot-s8plus.sh KERNEL STOCK_BOOT.img OUT.img [fast|gpu|metal|safe|notouch]
+#   make-boot-s8plus.sh KERNEL STOCK_BOOT.img OUT.img [fast|gpu|metal|replay|safe|notouch]
 #
 # fast (default, tested 2026-11-05): eight cores, A53 1690 / Mongoose 2314 MHz
 #   through ACPM (needs the 0137-staged DVFS firmware in the kernel), 1 GiB
@@ -42,17 +42,29 @@ gpu)
 		s8gpu=1 sweetfb_gpu=1 sweetfb_hz=30)
 	;;
 metal)
-	# gpu + the Metal driver (S8_OVERLAY = metal/stage3.ovl), for debugging
-	# stage 3 only: the Metal job chains hang the Mali (screen black). The
-	# matrix/shader tests of the loader (s8gpu=2) write 0x8a0000000+, so 512 MiB.
-	export S8_DRAM_MIB=512
+	# gpu + the Metal driver (S8_OVERLAY = metal/stage3.ovl), stage 3. Until
+	# 2026-11-06 every vertex job hung the Mali (air2nir gave vertex inputs
+	# driver_location 15 + L, past the attribute table). 1 GiB and s8gpu=1 as
+	# gpu: the 512 MiB s8gpu=2 boots (replay, metal) all failed even the
+	# kernel's present with js 0x42 (JOB_READ_FAULT), the 1 GiB one did not.
+	export S8_DRAM_MIB=${S8_DRAM_MIB:-1024}
 	: "${S8_OVERLAY:?S8_OVERLAY must name the Metal overlay (stage3.ovl)}"
 	args=(cpus=8 s8mngs=0 s8cpufreq=1690000 s8cpufreq_big=2314000 "s8noexec=$noexec"
-		s8gpu=2 sweetfb_gpu=1 s8metal=1 sweetfb_hz=30)
+		s8gpu=1 sweetfb_gpu=1 s8metal=1 sweetfb_hz=30)
+	;;
+replay)
+	# gpu with the loader's replay (s8gpu=2) of the job chains in
+	# s8_mali_replay.h (MX R1/R2) before XNU starts; s8gpu=3 adds the
+	# address/shader matrix. No s8metal. 1 GiB for a table made by
+	# dump2replay.py (iOS's memory at 0x8c1000000+, above XNU's RAM); a
+	# replay-gen.c table (0x8b0000000) or the matrix needs S8_DRAM_MIB=512.
+	export S8_DRAM_MIB=${S8_DRAM_MIB:-1024}
+	args=(cpus=8 s8mngs=0 s8cpufreq=1690000 s8cpufreq_big=2314000 "s8noexec=$noexec"
+		s8gpu=2 sweetfb_gpu=1 sweetfb_hz=30)
 	;;
 safe)    args=(cpus=1) ;;
 notouch) args=(cpus=1 s8touch=0) ;;
-*) echo "mode: fast, gpu, metal, safe or notouch" >&2; exit 2 ;;
+*) echo "mode: fast, gpu, metal, replay, safe or notouch" >&2; exit 2 ;;
 esac
 
 bash "$here/make-boot.sh" "$kernel" "$stock" "$out" "${common[@]}" "${args[@]}"

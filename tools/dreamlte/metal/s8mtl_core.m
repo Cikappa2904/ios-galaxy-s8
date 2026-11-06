@@ -84,6 +84,11 @@ static uint8_t *s8_slab_cpu;
 static uint64_t s8_slab_gpu, s8_slab_used = S8_SLAB;
 static uint64_t s8_bytes_live;
 
+/* Every /dev/s8mali allocation alive, for s8_mem_regions (the dump of a
+ * failed job chain, s8mtl_draw.c). */
+#define S8_REGIONS 512
+static struct { uint64_t gpu, size; void *cpu; } s8_region[S8_REGIONS];
+
 static int s8_raw_alloc(uint64_t size, uint64_t *gpu, void **cpu)
 {
 	struct s8mali_alloc a = { .size = size };
@@ -91,7 +96,29 @@ static int s8_raw_alloc(uint64_t size, uint64_t *gpu, void **cpu)
 		return -1;
 	*gpu = a.gpu_va;
 	*cpu = (void *)(uintptr_t)a.user_va;
+	for (unsigned i = 0; i < S8_REGIONS; i++) {
+		if (s8_region[i].size == 0) {
+			s8_region[i].gpu = a.gpu_va;
+			s8_region[i].size = a.size;
+			s8_region[i].cpu = *cpu;
+			break;
+		}
+	}
 	return 0;
+}
+
+unsigned s8_mem_regions(uint64_t *gpu, void **cpu, uint64_t *size, unsigned max)
+{
+	unsigned n = 0;
+	for (unsigned i = 0; i < S8_REGIONS && n < max; i++) {
+		if (s8_region[i].size == 0)
+			continue;
+		gpu[n] = s8_region[i].gpu;
+		cpu[n] = s8_region[i].cpu;
+		size[n] = s8_region[i].size;
+		n++;
+	}
+	return n;
 }
 
 int s8_mem_alloc(s8_mem *m, uint64_t size, uint64_t align)
@@ -146,6 +173,9 @@ void s8_mem_free(s8_mem *m)
 		struct s8mali_free f = { .gpu_va = m->gpu };
 		ioctl(s8_dev, S8MALI_FREE, &f);
 		s8_bytes_live -= m->size;
+		for (unsigned i = 0; i < S8_REGIONS; i++)
+			if (s8_region[i].size && s8_region[i].gpu == m->gpu)
+				s8_region[i].size = 0;
 	} else {
 		unsigned c = 0;
 		while ((256u << c) < m->size)

@@ -17,4 +17,6 @@ typedef struct {
 } s8_mem;
 int s8_mem_alloc(s8_mem *m, uint64_t size, uint64_t align);
 void s8_mem_free(s8_mem *m);
+/* The /dev/s8mali allocations alive (slabs and big blocks); returns the count. */
+unsigned s8_mem_regions(uint64_t *gpu, void **cpu, uint64_t *size, unsigned max);
 uint64_t s8_now_ns(void);

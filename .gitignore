@@ -14,3 +14,5 @@ shim/a5xelte/out4k/
 shim/a5xelte/outxnu/
 shim/dreamlte/out/
 logs/
+# generated loader replay tables (tools/dreamlte/metal/test)
+tools/dreamlte/s8_mali_replay.h

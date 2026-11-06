@@ -27,6 +27,8 @@ static uint8_t *mem;
 static uint64_t used;
 static struct pandecode_context *dec;
 static int submits, failures;
+static uint64_t region_gpu[64], region_size[64];
+static unsigned nregions;
 
 void s8_log(const char *fmt, ...)
 {
@@ -56,10 +58,25 @@ int s8_mem_alloc(s8_mem *m, uint64_t size, uint64_t align)
 	m->gpu = S8T_BASE + at;
 	m->size = size;
 	m->big = 1;
+	if (nregions < 64) {
+		region_gpu[nregions] = m->gpu;
+		region_size[nregions++] = size;
+	}
 	return 0;
 }
 
 void s8_mem_free(s8_mem *m) { (void)m; }
+
+unsigned s8_mem_regions(uint64_t *gpu, void **cpu, uint64_t *size, unsigned max)
+{
+	unsigned n = 0;
+	for (; n < nregions && n < max; n++) {
+		gpu[n] = region_gpu[n];
+		cpu[n] = mem + (region_gpu[n] - S8T_BASE);
+		size[n] = region_size[n];
+	}
+	return n;
+}
 
 /* s8mtl_draw.c's /dev/s8mali requests. */
 int ioctl(int fd, unsigned long req, ...)
@@ -85,6 +102,19 @@ int ioctl(int fd, unsigned long req, ...)
 		pandecode_jc(dec, s->jc, 0x60a00001);
 		s->result = 0;
 		submits++;
+		/* S8_DUMP_REF=FILE: fail the first vertex/tiler chain (s8mtl_draw.c
+		 * then logs its dump) and save the memory as it is to FILE. */
+		const char *ref = getenv("S8_DUMP_REF");
+		static int failed;
+		if (ref && s->slot == 1 && !failed++) {
+			FILE *f = fopen(ref, "wb");
+			if (f) {
+				fwrite(mem, 1, used, f);
+				fclose(f);
+			}
+			s->result = 2;
+			s->js_status = 8;
+		}
 		return 0;
 	}
 	return -1;

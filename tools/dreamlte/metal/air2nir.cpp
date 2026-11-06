@@ -840,6 +840,12 @@ nir_shader *Translator::run()
 			continue;
 		if (a.kind == "air.vertex_input") {
 			nir_variable *v = io_var(nir_var_shader_in, "attr", glsl(t), VERT_ATTRIB_GENERIC0 + a.location);
+			/* The Bifrost compiler indexes the attribute table with
+			 * driver_location: Metal attribute L is entry L of the
+			 * table s8mtl_draw.c builds (as PanVK, panvk_vX_shader.c).
+			 * With VERT_ATTRIB_GENERIC0 + L (15 + L) every vertex job
+			 * read descriptors past the table and hung the G71. */
+			v->data.driver_location = a.location;
 			vals[&arg] = { nir_load_var(&b, v) };
 		} else if (a.kind == "air.fragment_input") {
 			nir_variable *v = io_var(nir_var_shader_in, a.varying.c_str(), glsl(t), varying_slot(a.varying));
@@ -1633,7 +1639,9 @@ static nir_variable *test_var(nir_shader *s, nir_variable_mode mode, const char 
 {
 	nir_variable *v = nir_variable_create(s, mode, t, name);
 	v->data.location = location;
-	v->data.driver_location = location;
+	/* vertex inputs: attribute table entry, as Translator::run */
+	v->data.driver_location = mode == nir_var_shader_in && s->info.stage == MESA_SHADER_VERTEX ?
+	    location - VERT_ATTRIB_GENERIC0 : location;
 	return v;
 }
 
@@ -1817,6 +1825,21 @@ int main(int argc, char **argv)
 	NIR_PASS(_, s, nir_opt_algebraic);
 	NIR_PASS(_, s, nir_opt_dce);
 	pan_shader_compile(s, &inputs, &binary, &info);
+	if (stage == MESA_SHADER_VERTEX) {
+		/* Attribute L is table entry L, with holes; pan_shader.c counts
+		 * the attributes read. The RSD needs the highest entry + 1, as
+		 * PanVK patches it (panvk_vX_shader.c): std_vert1_lph reads
+		 * 0, 1 and 3, and with a count of 3 its vertex job hung the G71. */
+		uint64_t gen = (info.attributes_read & VERT_BIT_GENERIC_ALL) >> VERT_ATTRIB_GENERIC0;
+		info.attribute_count = util_last_bit64(gen);
+	}
+	/* s8mtl_draw.c always binds the full 32-entry texture and sampler
+	 * tables (inline samplers from 16, the null texture at 31). The G71
+	 * range-checks against the RSD counts, which pan_shader.c takes from
+	 * textures_used (empty here): a fragment shader sampling with inline
+	 * sampler 16 and counts 0 faulted with ADDRESS_RANGE (0x5a). */
+	info.texture_count = 32;
+	info.sampler_count = 32;
 
 	fprintf(stderr, "air2nir: %s: %u bytes, %u work registers, %u attributes, %u UBOs, %u textures, "
 	    "%u samplers, %u varyings\n", fname.c_str(), binary.size, info.work_reg_count, info.attribute_count,

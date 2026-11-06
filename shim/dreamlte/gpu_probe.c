@@ -450,6 +450,187 @@ static void bl_case(void (*kv)(const char *, uint64_t), void (*out)(const char *
 	wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
 }
 
+/*
+ * Cases R1/R2 (2026-11-06): with the kernel's present job working, iOS's
+ * Metal vertex/tiler chains (s8mtl_draw.c) still stay ACTIVE with no fault
+ * and wedge the GPU. tools/dreamlte/metal/test/build-replay.sh runs that
+ * draw path on the host with the test shaders and records its job chains
+ * (s8_mali_replay.h: 'P' 4 KiB pages of GPU memory at RP_BASE, 'S' submits,
+ * 'E' end with the bytes used). Here they are replayed on the GPU, in
+ * IDENTITY (R1) and through page tables built as the kernel's (R2): per
+ * chain the JS status, the job the slot is on (JS_HEAD) and every job's
+ * exception status, so the stalling job type shows up. The first chain is
+ * also recorded as its vertex job alone and its tiler job alone.
+ */
+/* Generated, not committed (tools/dreamlte/metal/test/build-replay.sh,
+ * dump2replay.py, gen-suite): without it the replay is an empty table. */
+#if __has_include("../../tools/dreamlte/s8_mali_replay.h")
+#include "../../tools/dreamlte/s8_mali_replay.h"
+#else
+#define S8_REPLAY_SIZE 16u
+/* one 'E' record; sized past the reads the parser could do */
+static const unsigned char s8_replay[256] __attribute__((aligned(16))) = { 'E' };
+#endif
+
+/* Range base: a 'B' record (dump2replay.py: iOS's memory at 0x8c1000000+),
+ * else replay-gen.c's S8T_BASE. The table pool follows the range. */
+#define RP_BASE_DEFAULT	0x8b0000000ULL
+#define RP_PT_PAGES	128u
+static uint64_t rp_base = RP_BASE_DEFAULT, rp_pt;
+static unsigned rp_pt_used;
+
+static uint32_t rp32(unsigned off) { return *(const volatile uint32_t *)(s8_replay + off); }
+static uint64_t rp64(unsigned off) { return *(const volatile uint64_t *)(s8_replay + off); }
+
+static int rp_map(uint64_t va, uint64_t len)
+{
+	for (uint64_t o = 0; o < len; o += 4096) {
+		unsigned table = 0;
+		for (unsigned lv = 0; lv < 3; lv++) {
+			unsigned idx = (unsigned)((va + o) >> (39 - 9 * lv)) & 511;
+			uint64_t e = rp_pt + (uint64_t)table * 4096 + idx * 8;
+			uint64_t v = *(volatile uint64_t *)(uintptr_t)e;
+			if ((v & 3) != 3) {
+				if (rp_pt_used == RP_PT_PAGES)
+					return 0;
+				table = rp_pt_used++;
+				w64(e, (rp_pt + (uint64_t)table * 4096) | (1ULL << 10) | 3);
+			} else {
+				table = (unsigned)(((v & 0xfffffffff000ULL) - rp_pt) / 4096);
+			}
+		}
+		w64(rp_pt + (uint64_t)table * 4096 + (((va + o) >> 12) & 511) * 8,
+		    ((va + o) & 0xfffffffff000ULL) | (1ULL << 6) | (1ULL << 10) | 3);
+	}
+	return 1;
+}
+
+static int rp_as(int tables)
+{
+	return tables ? mx_as(6, rp_pt) : mx_as(2, 0);
+}
+
+static void rp_run(void (*kv)(const char *, uint64_t), void (*out)(const char *),
+    uint32_t shaders, int tables)
+{
+	out(tables ? "MX R2: Metal replay, page tables\n" : "MX R1: Metal replay, IDENTITY\n");
+	uint64_t used = 0;
+	for (unsigned off = 0; off + 16 <= S8_REPLAY_SIZE;) {
+		uint32_t tag = rp32(off);
+		if (tag == 'B') {
+			rp_base = rp64(off + 8);
+			off += 16;
+		} else if (tag == 'P') {
+			off += 16 + 4096;
+		} else if (tag == 'S') {
+			off += 128;
+		} else {
+			used = tag == 'E' ? rp64(off + 8) : 0;
+			break;
+		}
+	}
+	rp_pt = (rp_base + used + 0xfffff) & ~0xfffffULL;
+	kv("base", rp_base);
+	kv("bytes", used);
+	if (used == 0 || used > (96ULL << 20)) {
+		out("bad replay table\n");
+		return;
+	}
+	for (uint64_t o = 0; o < used; o += 8)
+		w64(rp_base + o, 0);
+	if (tables) {
+		for (unsigned i = 0; i < RP_PT_PAGES * 512; i++)
+			w64(rp_pt + i * 8, 0);
+		rp_pt_used = 1;
+		kv("mapped", rp_map(rp_base, (used + 4095) & ~4095ULL));
+		kv("pt pages", rp_pt_used);
+		__asm__ volatile("dsb sy" ::: "memory");
+	}
+	kv("as0 update", rp_as(tables));
+	out("\n");
+	unsigned chains = 0, ok = 0;
+	for (unsigned off = 0; off + 16 <= S8_REPLAY_SIZE;) {
+		uint32_t tag = rp32(off);
+		if (tag == 'B') {
+			off += 16;
+			continue;
+		}
+		if (tag == 'P') {
+			uint64_t a = rp64(off + 8);
+			for (unsigned i = 0; i < 4096; i += 8)
+				w64(a + i, rp64(off + 16 + i));
+			off += 16 + 4096;
+			continue;
+		}
+		if (tag != 'S')
+			break;
+		unsigned slot = rp32(off + 4), nj = rp32(off + 24);
+		uint64_t jc = rp64(off + 8), probe = rp64(off + 16);
+		char label[33];
+		for (unsigned i = 0; i < 32; i++)
+			label[i] = (char)s8_replay[off + 96 + i];
+		label[32] = 0;
+		chains++;
+		__asm__ volatile("dsb sy" ::: "memory");
+		uintptr_t js = MALI + JS0 + 0x80 * slot;
+		uint32_t done = 1u << slot, fail = 1u << (16 + slot);
+		wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+		wr(js + 0x40, (uint32_t)jc);			/* JS_HEAD_NEXT */
+		wr(js + 0x44, (uint32_t)(jc >> 32));
+		wr(js + 0x50, shaders);				/* JS_AFFINITY_NEXT */
+		wr(js + 0x54, 0);
+		wr(js + 0x58, (8u << 16) | (3u << 12) | (3u << 8));
+		wr(js + 0x60, 1);				/* JS_COMMAND_START */
+		uint64_t t0 = ticks(), end = t0 + TIMER_HZ / 5;	/* 200 ms */
+		while (ticks() < end && !(rd(MALI + JOB_IRQ_RAWSTAT) & (done | fail)))
+			;
+		uint64_t us = (ticks() - t0) / (TIMER_HZ / 1000000);
+		uint32_t irq = rd(MALI + JOB_IRQ_RAWSTAT), st = rd(js + 0x24);
+		uint64_t head = ((uint64_t)rd(js + 0x04) << 32) | rd(js + 0x00);
+		uint32_t fault = rd(MALI + AS0 + 0x1c);
+		uint64_t faddr = ((uint64_t)rd(MALI + AS0 + 0x24) << 32) | rd(MALI + AS0 + 0x20);
+		int good = (irq & done) && !(irq & fail), stopped = 0;
+		if (!good) {
+			wr(js + 0x60, 3);			/* JS_COMMAND_HARD_STOP */
+			stopped = wait_mask(MALI + JOB_IRQ_RAWSTAT, done | fail, done | fail, 50);
+		}
+		/* Two lines per chain: XNU echoes only 120 loader lines. */
+		out("R ");
+		out(label);
+		out(": ");
+		kv("irq", irq);
+		kv("js", st);
+		kv("us", us);
+		kv("head", head);
+		kv("fault", fault);
+		kv("faddr", faddr);
+		out("\n ");
+		for (unsigned i = 0; i < nj && i < 8; i++) {
+			uint64_t j = rp64(off + 32 + i * 8);
+			kv(" t", (r32(j + 0x10) >> 1) & 0x7f);
+			kv("e", r32(j));
+		}
+		if (probe)
+			kv(" pixel", r32(probe));
+		if (!good) {
+			kv(" stop", stopped);
+			kv("js", rd(js + 0x24));
+		}
+		out("\n");
+		if (good) {
+			ok++;
+		} else {
+			mx_power(shaders);
+			rp_as(tables);
+		}
+		wr(MALI + JOB_IRQ_CLEAR, 0xffffffffu);
+		off += 128;
+	}
+	kv("chains", chains);
+	kv("done", ok);
+	out("\n");
+}
+
 static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char *), uint32_t shaders,
     int matrix)
 {
@@ -506,8 +687,13 @@ static void gpu_jobs(void (*kv)(const char *, uint64_t), void (*out)(const char 
 	out("\n");
 	if (get32(0x100) == magic) {
 		gpu_draw(kv, out, shaders);
-		if (matrix)
-			gpu_matrix(kv, out, shaders);
+		if (matrix) {
+			if (matrix > 1)			/* s8gpu=3 */
+				gpu_matrix(kv, out, shaders);
+			rp_run(kv, out, shaders, 0);
+			rp_run(kv, out, shaders, 1);
+			mx_as(2, 0);			/* back to IDENTITY */
+		}
 	}
 }
 
@@ -543,6 +729,13 @@ int gpu_probe(void (*kv)(const char *, uint64_t), void (*out)(const char *), int
 	out("\n");
 	kv("SHADER_PRESENT", rd(MALI + 0x100));
 	kv("L2_PRESENT", rd(MALI + 0x120));
+	out("\n");
+	/* Thread storage sizing (Mesa pan_query_thread_tls_alloc: TLS_ALLOC,
+	 * else MAX_THREADS); s8mtl_draw.c assumed 256 threads per core. */
+	kv("THREAD_MAX_THREADS", rd(MALI + 0x0a0));
+	kv("WG", rd(MALI + 0x0a4));
+	kv("FEATURES", rd(MALI + 0x0ac));
+	kv("TLS_ALLOC", rd(MALI + 0x310));
 	out("\n");
 	/* kbase GPU_ID2_PRODUCT_TMIX = MAKE(6, 0, 10, 0) = 0x60a0 (Mali-G71). */
 	int g71 = (id >> 16) == 0x60a0;

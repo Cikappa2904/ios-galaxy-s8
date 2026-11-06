@@ -459,7 +459,9 @@ int s8d_init(void)
 	s8g.null_texture_desc = s8g.statics.gpu + 0x480;
 	s8g.tiler_features = info.tiler_features;
 	s8g.core_id_range = util_last_bit(info.shader_present);
-	s8g.threads_per_core = 256;     /* G71: THREAD_MAX_THREADS */
+	/* Thread storage instances per core (Mesa pan_query_thread_tls_alloc):
+	 * the S8's G71 reads THREAD_TLS_ALLOC 0, THREAD_MAX_THREADS 0x180. */
+	s8g.threads_per_core = 384;
 	s8g.state = 1;
 	s8_log("MTL draw: %u shaders in the cache, tiler heap %u MiB, %u cores",
 	    s8g.count, S8_TILER_HEAP >> 20, util_bitcount(info.shader_present));
@@ -939,6 +941,9 @@ struct s8_pass {
 	struct s8_ptr tiler_ctx, tiler_heap, tls, fragment, preload_dcd;
 	uint32_t tls_size;
 	unsigned skipped;
+#define S8_LOG_JOBS 8
+	struct s8_ptr jobs[S8_LOG_JOBS];        /* first vertex/tiler jobs */
+	unsigned njobs;
 };
 
 struct s8d_cmdbuf {
@@ -1399,7 +1404,9 @@ static int s8_attributes(struct s8d_cmdbuf *cb, struct s8d_pipeline *pl, unsigne
 		}
 	}
 	struct s8_ptr bd = s8_alloc_descs(&cb->arena, nslots * 2 + 1, ATTRIBUTE_BUFFER);
-	struct s8_ptr ad = s8_alloc_descs(&cb->arena, pl->nattribs, ATTRIBUTE);
+	/* All S8D_MAX_ATTRIBS entries: an attribute the shader reads but the
+	 * pipeline does not describe is constant zero, not whatever follows. */
+	struct s8_ptr ad = s8_alloc_descs(&cb->arena, S8D_MAX_ATTRIBS, ATTRIBUTE);
 	if (!bd.cpu || !ad.cpu)
 		return -1;
 	struct mali_attribute_buffer_packed *bdesc = bd.cpu;
@@ -1429,7 +1436,7 @@ static int s8_attributes(struct s8d_cmdbuf *cb, struct s8d_pipeline *pl, unsigne
 	}
 	memset(&bdesc[nslots * 2], 0, pan_size(ATTRIBUTE_BUFFER));
 	struct mali_attribute_packed *adesc = ad.cpu;
-	for (unsigned i = 0; i < pl->nattribs; i++) {
+	for (unsigned i = 0; i < S8D_MAX_ATTRIBS; i++) {
 		const struct s8d_vertex_attrib *a = &pl->attribs[i];
 		enum pipe_format pf = s8_vertex_format(a->format);
 		unsigned b = a->buffer < S8D_MAX_BUFFERS ? a->buffer : 0;
@@ -1677,23 +1684,125 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 	struct pan_ptr vjp = { .cpu = vj.cpu, .gpu = vj.gpu }, tjp = { .cpu = tj.cpu, .gpu = tj.gpu };
 	unsigned vid = pan_jc_add_job(&p->jc, MALI_JOB_TYPE_VERTEX, false, false, 0, 0, &vjp, false);
 	pan_jc_add_job(&p->jc, MALI_JOB_TYPE_TILER, false, false, vid, 0, &tjp, false);
+	if (p->njobs + 2 <= S8_LOG_JOBS) {     /* for the failure log */
+		p->jobs[p->njobs++] = vj;
+		p->jobs[p->njobs++] = tj;
+	}
 	p->draws++;
 }
 
 /* ---- execution ---- */
 
-static int s8_submit(uint64_t jc, unsigned slot, const char *what, unsigned pass_draws)
+static int s8_submit(uint64_t jc, unsigned slot, const char *what, unsigned pass_draws,
+    const struct s8_ptr *jobs, unsigned njobs)
 {
 	static unsigned faults;
 	struct s8mali_submit s = { .jc = jc, .slot = slot, .timeout_ms = 2000 };
 	if (ioctl(s8_fd(), S8MALI_SUBMIT, &s) != 0 || s.result != 0) {
-		if (faults++ < 30)
+		if (faults++ < 30) {
 			s8_log("MTL %s job chain failed: result %u js 0x%x irq 0x%x fault 0x%x at 0x%llx (%u draws)",
 			    what, s.result, s.js_status, s.irq_rawstat, s.as_fault,
 			    (unsigned long long)s.as_fault_addr, pass_draws);
+			/* Job headers as the GPU left them: exception status,
+			 * first incomplete task, fault pointer (the address the
+			 * job could not access), type. */
+			for (unsigned i = 0; i < njobs; i++) {
+				const volatile uint32_t *h = jobs[i].cpu;
+				s8_log("MTL   job %u at 0x%llx: type %u exc 0x%x task 0x%x fault ptr 0x%llx",
+				    i, (unsigned long long)jobs[i].gpu, (h[4] >> 1) & 0x7f, h[0], h[1],
+				    (unsigned long long)h[2] | (unsigned long long)h[3] << 32);
+			}
+		}
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Once, after the first failed vertex/tiler chain: every non-zero 72-byte
+ * block of the GPU memory this process owns (allocations up to 4 MiB, so
+ * the slabs with all descriptors, shaders and small buffers, not the tiler
+ * heap or big textures) as "MTL D <gpu> <base64>" lines, plus the chain
+ * head. tools/dreamlte/metal/test/undump.py rebuilds the memory from the
+ * kernel log for pandecode and the loader replay.
+ */
+static void s8_b64(char *out, const uint8_t *in, unsigned n)
+{
+	static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	for (unsigned i = 0; i < n; i += 3) {
+		uint32_t v = (uint32_t)in[i] << 16 | (uint32_t)(i + 1 < n ? in[i + 1] : 0) << 8 |
+		    (i + 2 < n ? in[i + 2] : 0);
+		*out++ = t[v >> 18];
+		*out++ = t[(v >> 12) & 63];
+		*out++ = i + 1 < n ? t[(v >> 6) & 63] : '=';
+		*out++ = i + 2 < n ? t[v & 63] : '=';
+	}
+	*out = 0;
+}
+
+#define S8_DUMP_BLOCK 72
+#define S8_DUMP_MAX_LINES 24000         /* ~2.7 MB of the 4 MiB console ring */
+
+/* The slabs (4 MiB: descriptors, shaders, small buffers), the command
+ * buffer chunks (S8_CHUNK) and allocations up to 256 KiB; not the tiler
+ * heap, textures or big buffers. */
+static int s8_dump_wanted(uint64_t size)
+{
+	return size == (4u << 20) || size == S8_CHUNK || size <= (256u << 10);
+}
+
+static void s8_dump(uint64_t jc, unsigned slot)
+{
+	static int done;
+	if (done++)
+		return;
+	uint64_t gpu[64], size[64];
+	void *cpu[64];
+	unsigned n = s8_mem_regions(gpu, cpu, size, 64), lines = 0;
+	s8_log("MTL dump begin: chain 0x%llx slot %u, %u regions", (unsigned long long)jc, slot, n);
+	for (unsigned r = 0; r < n; r++) {
+		s8_log("MTL dump region 0x%llx size 0x%llx%s", (unsigned long long)gpu[r],
+		    (unsigned long long)size[r], s8_dump_wanted(size[r]) ? "" : " (skipped)");
+		if (!s8_dump_wanted(size[r]))
+			continue;
+		const volatile uint8_t *src = cpu[r];
+		for (uint64_t o = 0; o + S8_DUMP_BLOCK <= size[r] && lines < S8_DUMP_MAX_LINES;
+		    o += S8_DUMP_BLOCK) {
+			uint8_t b[S8_DUMP_BLOCK];
+			int any = 0;
+			for (unsigned i = 0; i < S8_DUMP_BLOCK; i++) {
+				b[i] = src[o + i];
+				any |= b[i];
+			}
+			if (!any)
+				continue;
+			char line[S8_DUMP_BLOCK / 3 * 4 + 1];
+			s8_b64(line, b, S8_DUMP_BLOCK);
+			s8_log("MTL D %llx %s", (unsigned long long)(gpu[r] + o), line);
+			/* the console ring is 4 MiB and flushed every 10 s: pace it */
+			if ((++lines & 255) == 0)
+				usleep(20000);
+		}
+	}
+	s8_log("MTL dump end: %u lines", lines);
+}
+
+/* GPU memory the passes use, for matching fault pointers (first failures). */
+static void s8_log_layout(const struct s8_pass *p)
+{
+	static unsigned logged;
+	if (logged++ >= 3)
+		return;
+	/* S8MALI_LOG lines hold 119 characters */
+	s8_log("MTL layout: target 0x%llx %ux%u bpr %u fmt %u, fbd 0x%llx",
+	    (unsigned long long)p->target.gpu, p->target.width, p->target.height, p->target.row_bytes,
+	    p->target.format, (unsigned long long)p->fbd.gpu);
+	s8_log("MTL layout: tiler ctx 0x%llx heap desc 0x%llx heap 0x%llx+0x%llx",
+	    (unsigned long long)p->tiler_ctx.gpu, (unsigned long long)p->tiler_heap.gpu,
+	    (unsigned long long)s8g.tiler_heap.gpu, (unsigned long long)s8g.tiler_heap.size);
+	s8_log("MTL layout: tls desc 0x%llx per thread %u, storage 0x%llx+0x%llx",
+	    (unsigned long long)p->tls.gpu, p->tls_size, (unsigned long long)s8g.tls.gpu,
+	    (unsigned long long)s8g.tls.size);
 }
 
 /* Frame shader DCD that reloads the target (pan_preload_emit_dcd). */
@@ -1714,6 +1823,9 @@ static int s8_preload(struct s8d_cmdbuf *cb, struct s8_pass *p)
 	pan_unpack(&sh->rsd, RENDERER_STATE, rs);
 	pan_pack((struct mali_renderer_state_packed *)rsd.cpu, RENDERER_STATE, cfg) {
 		cfg = rs;
+		/* its own one-entry tables below (the cache's RSDs say 32) */
+		cfg.shader.texture_count = 1;
+		cfg.shader.sampler_count = 1;
 		cfg.multisample_misc.sample_mask = 0xFFFF;
 		cfg.multisample_misc.depth_function = MALI_FUNC_ALWAYS;
 		cfg.stencil_mask_misc.stencil_mask_front = 0xFF;
@@ -1863,11 +1975,16 @@ int s8d_pass_execute(struct s8d_cmdbuf *cb, int idx)
 		cfg.framebuffer = p->fbd.gpu | 1;     /* MFBD, one RT, no ZS/CRC extension */
 	}
 
-	if (p->draws && s8_submit(p->jc.first_job, 1, "vertex/tiler", p->draws) != 0)
+	if (p->draws && s8_submit(p->jc.first_job, 1, "vertex/tiler", p->draws, p->jobs, p->njobs) != 0) {
+		s8_log_layout(p);
+		s8_dump(p->jc.first_job, 1);
 		return -1;
+	}
 	uint64_t t1 = s8_now_ns();
-	if (s8_submit(p->fragment.gpu, 0, "fragment", p->draws) != 0)
+	if (s8_submit(p->fragment.gpu, 0, "fragment", p->draws, &p->fragment, 1) != 0) {
+		s8_log_layout(p);
 		return -1;
+	}
 	uint64_t t2 = s8_now_ns();
 	if (logged++ < 40 || logged % 500 == 0)
 		s8_log("MTL pass %ux%u fmt %u load %u: %u draws (%u skipped), vt %llu us, frag %llu us",
