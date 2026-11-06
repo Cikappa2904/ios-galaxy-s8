@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -185,7 +185,9 @@
+ 	const volatile char *t = (const volatile char *)(hdr + 3);
+ 	uint32_t n = A5_KLOG_SIZE - 12, i = 0, start = UINT32_MAX;
+ 	char line[160];
+-	for (uint32_t lines = 0; i < n && lines < 120; ) {
++	/* 0142: up to 1000 lines (the loader's GPU job tests print more than 120) */
++	uint32_t lines = 0;
++	for (; i < n && lines < 1000; ) {
+ 		uint32_t len = 0;
+ 		while (i < n && t[i] != '\n' && t[i] != 0) {
+ 			if (len < sizeof(line) - 1) {
+@@ -212,6 +214,7 @@
+ 			}
+ 		}
+ 	}
++	IOLog("S8 LOADER: %u lines echoed\n", lines);
+ }
+ #endif
+ 
