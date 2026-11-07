@@ -757,6 +757,23 @@ static int s8_fc_ubo(const struct s8_shader *s, const char *key, uint64_t *gpu, 
 			k = semi ? semi + 1 : NULL;
 		}
 	}
+	/* "@index=0xbits": set by index (s8_constants_key), after the names */
+	for (const char *k = key; k != NULL && *k;) {
+		const char *semi = strchr(k, ';');
+		const char *eq = strchr(k, '=');
+		if (*k == '@' && eq != NULL && (semi == NULL || eq < semi)) {
+			unsigned long index = strtoul(k + 1, NULL, 10);
+			for (unsigned i = 0; i < s->nconst; i++) {
+				if (s->consts[i].index != index)
+					continue;
+				uint64_t v = strtoull(eq + 1, NULL, 0);
+				uint32_t one = 1;
+				memcpy(buf + index * 16, &v, 8);
+				memcpy(buf + index * 16 + 8, &one, 4);
+			}
+		}
+		k = semi ? semi + 1 : NULL;
+	}
 	memcpy(p.cpu, buf, *size);
 	*gpu = p.gpu;
 	return 0;

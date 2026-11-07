@@ -166,7 +166,7 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out);
 	id _s8device;
 	id _name;               /* NSString */
 	NSUInteger _type;
-	char _constants[1024];  /* function constants, "name=0xbits;..." */
+	char _constants[2048];  /* function constants, "name=0xbits;...;@index=0xbits..." */
 }
 @end
 

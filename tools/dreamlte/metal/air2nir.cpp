@@ -391,6 +391,23 @@ static void fold_dynamic(Module &m)
 	std::map<unsigned, std::string> names;
 	for (auto &dc : dynamic_constants)
 		names[dc.index] = dc.name;
+	/* "@index" entries (set by index in Metal) name the constant by its
+	 * index; they come after the names and win, as in the driver */
+	std::map<std::string, uint64_t> by_index;
+	for (auto it = fold_values.begin(); it != fold_values.end();) {
+		if (it->first.size() > 1 && it->first[0] == '@') {
+			unsigned index = (unsigned)strtoul(it->first.c_str() + 1, nullptr, 10);
+			if (names.count(index))
+				by_index[names[index]] = it->second;
+			else
+				fprintf(stderr, "air2nir: note: constant index %u is not the function's\n", index);
+			it = fold_values.erase(it);
+		} else {
+			++it;
+		}
+	}
+	for (auto &[name, v] : by_index)
+		fold_values[name] = v;
 	std::vector<CallInst *> calls;
 	for (Function &f : m)
 		if (f.getName() == "s8.fcdef" || f.getName().starts_with("s8.fc."))

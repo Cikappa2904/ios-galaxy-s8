@@ -63,8 +63,29 @@ static unsigned s8_type_size(NSUInteger t)
 	return 0;
 }
 
+static uint64_t s8_constant_bits(id v)
+{
+	unsigned sz = s8_type_size([v dataType]);
+	const uint8_t *d = [v data];
+	uint64_t bits = 0;
+	for (unsigned k = 0; k < sz && k < 8 && d != NULL; k++)
+		bits |= (uint64_t)d[k] << (8 * k);
+	return bits;
+}
+
+/*
+ * ... then the constants set by index (-setConstantValue:type:atIndex:,
+ * -setConstantValues:type:withRange:), which Metal keeps apart
+ * (-newIndexedConstantArray, MTLIndexedConstantValue), as "@index=0xbits".
+ * CoreAnimation sets fixed_frag's per-image plane and texcoord counts that
+ * way: read by name only they were 0, the uber shader skipped every image
+ * (plane_count0 == 0) and layers drew as flat rectangles (boot shot1).
+ * Index entries come last and win over a name for the same constant
+ * (s8_fc_ubo, air2nir -F).
+ */
 static void s8_constants_key(id values, char *out, size_t len)
 {
+	static unsigned logged;
 	size_t n = 0;
 	out[0] = 0;
 	id arr = [values newNamedConstantArray];
@@ -72,20 +93,38 @@ static void s8_constants_key(id values, char *out, size_t len)
 	for (NSUInteger i = 0; i < count; i++) {
 		id v = [arr objectAtIndex:i];
 		const char *name = [[v name] UTF8String];
-		NSUInteger type = [v dataType];
-		const uint8_t *d = [v data];
-		unsigned sz = s8_type_size(type);
-		uint64_t bits = 0;
-		for (unsigned k = 0; k < sz && k < 8 && d != NULL; k++)
-			bits |= (uint64_t)d[k] << (8 * k);
 		int w = snprintf(out + n, len - n, "%s%s=0x%llx", n ? ";" : "", name ? name : "?",
-		    (unsigned long long)bits);
+		    (unsigned long long)s8_constant_bits(v));
 		if (w < 0 || (size_t)w >= len - n) {
 			out[n] = 0;
 			break;
 		}
 		n += (size_t)w;
 	}
+	[arr release];
+	if (![values respondsToSelector:@selector(newIndexedConstantArray)])
+		return;
+	arr = [values newIndexedConstantArray];
+	NSUInteger icount = [arr count];
+	for (NSUInteger i = 0; i < icount; i++) {
+		id v = [arr objectAtIndex:i];
+		if (![v respondsToSelector:@selector(index)] || ![v respondsToSelector:@selector(dataType)] ||
+		    ![v respondsToSelector:@selector(data)]) {
+			if (logged++ < 10)
+				s8_log("MTL constants: indexed value of class %s without index/dataType/data",
+				    class_getName(object_getClass(v)));
+			break;
+		}
+		int w = snprintf(out + n, len - n, "%s@%lu=0x%llx", n ? ";" : "", (unsigned long)[v index],
+		    (unsigned long long)s8_constant_bits(v));
+		if (w < 0 || (size_t)w >= len - n) {
+			out[n] = 0;
+			break;
+		}
+		n += (size_t)w;
+	}
+	if (icount != 0 && logged++ < 10)
+		s8_log("MTL constants: %lu named, %lu by index", (unsigned long)count, (unsigned long)icount);
 	[arr release];
 }
 

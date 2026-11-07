@@ -92,6 +92,8 @@ enum { MTLCommandBufferStatusCompleted = 4 };
 + (id)mainBundle;
 - (id)localizedDescription;
 - (id)newNamedConstantArray;
+- (id)newIndexedConstantArray;
+- (NSUInteger)index;
 - (id)objectAtIndex:(NSUInteger)i;
 - (NSUInteger)dataType;
 - (void *)data;
