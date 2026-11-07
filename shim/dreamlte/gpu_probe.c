@@ -482,7 +482,8 @@ static unsigned rp_pt_used;
 static uint32_t rp32(unsigned off) { return *(const volatile uint32_t *)(s8_replay + off); }
 static uint64_t rp64(unsigned off) { return *(const volatile uint64_t *)(s8_replay + off); }
 
-static int rp_map(uint64_t va, uint64_t len)
+/* GPU VA va..va+len -> PA pa.. through the table pool */
+static int rp_map(uint64_t va, uint64_t pa, uint64_t len)
 {
 	for (uint64_t o = 0; o < len; o += 4096) {
 		unsigned table = 0;
@@ -500,7 +501,7 @@ static int rp_map(uint64_t va, uint64_t len)
 			}
 		}
 		w64(rp_pt + (uint64_t)table * 4096 + (((va + o) >> 12) & 511) * 8,
-		    ((va + o) & 0xfffffffff000ULL) | (1ULL << 6) | (1ULL << 10) | 3);
+		    ((pa + o) & 0xfffffffff000ULL) | (1ULL << 6) | (1ULL << 10) | 3);
 	}
 	return 1;
 }
@@ -522,6 +523,8 @@ static void rp_run(void (*kv)(const char *, uint64_t), void (*out)(const char *)
 			off += 16;
 		} else if (tag == 'P') {
 			off += 16 + 4096;
+		} else if (tag == 'M') {
+			off += 32;
 		} else if (tag == 'S') {
 			off += 128;
 		} else {
@@ -542,7 +545,25 @@ static void rp_run(void (*kv)(const char *, uint64_t), void (*out)(const char *)
 		for (unsigned i = 0; i < RP_PT_PAGES * 512; i++)
 			w64(rp_pt + i * 8, 0);
 		rp_pt_used = 1;
-		kv("mapped", rp_map(rp_base, (used + 4095) & ~4095ULL));
+		kv("mapped", rp_map(rp_base, rp_base, (used + 4095) & ~4095ULL));
+		/* 'M' records: extra windows VA -> PA (inside the zeroed range),
+		 * e.g. an IOSurface render target the phone's kernel had mapped */
+		for (unsigned off = 0; off + 16 <= S8_REPLAY_SIZE;) {
+			uint32_t tag = rp32(off);
+			if (tag == 'M') {
+				kv("map va", rp64(off + 8));
+				kv("ok", rp_map(rp64(off + 8), rp64(off + 16), rp64(off + 24)));
+				off += 32;
+			} else if (tag == 'B') {
+				off += 16;
+			} else if (tag == 'P') {
+				off += 16 + 4096;
+			} else if (tag == 'S') {
+				off += 128;
+			} else {
+				break;
+			}
+		}
 		kv("pt pages", rp_pt_used);
 		__asm__ volatile("dsb sy" ::: "memory");
 	}
@@ -553,6 +574,10 @@ static void rp_run(void (*kv)(const char *, uint64_t), void (*out)(const char *)
 		uint32_t tag = rp32(off);
 		if (tag == 'B') {
 			off += 16;
+			continue;
+		}
+		if (tag == 'M') {
+			off += 32;
 			continue;
 		}
 		if (tag == 'P') {

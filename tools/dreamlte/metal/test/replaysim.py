@@ -35,6 +35,10 @@ while o + 16 <= len(b):
     if tag == ord('B'):
         base, flags = v, pad
         o += 16
+    elif tag == ord('M'):
+        va, pa, ln = struct.unpack_from('<QQQ', b, o + 8)
+        print(f'map 0x{va:x} -> 0x{pa:x} +0x{ln:x}')
+        o += 32
     elif tag == ord('P'):
         assert v % 4096 == 0
         pages[v] = bytearray(b[o + 16:o + 16 + 4096])
