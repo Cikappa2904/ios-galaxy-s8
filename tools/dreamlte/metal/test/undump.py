@@ -18,6 +18,7 @@ BLOCK = 72
 
 def parse(path):
     text = open(path, 'rb').read().decode('latin-1')
+    parse.text = text
     begin = re.search(r'MTL dump begin: chain 0x([0-9a-f]+) slot (\d+), (\d+) regions', text)
     end = re.search(r'MTL dump end: (\d+) lines', text)
     regions = [(int(a, 16), int(s, 16), bool(k)) for a, s, k in
@@ -43,6 +44,9 @@ def main():
     if not begin:
         sys.exit('no "MTL dump begin" in the log')
     print(f'chain 0x{begin.group(1)} slot {begin.group(2)}, {begin.group(3)} regions')
+    vt = re.search(r'MTL dump vt chain 0x([0-9a-f]+) fault 0x([0-9a-f]+)', parse.text)
+    if vt:
+        print(f'vertex/tiler chain 0x{vt.group(1)}, fault pointer 0x{vt.group(2)}')
     for a, s, skipped in regions:
         print(f'  region 0x{a:x} size 0x{s:x}{" skipped" if skipped else ""}')
     want = int(end.group(1)) if end else None

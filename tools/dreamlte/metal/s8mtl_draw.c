@@ -336,6 +336,10 @@ static int s8_parse_shader(struct s8_shader *s, const uint8_t *b, uint32_t size)
 			return -1;
 		s->data_gpu = cdata.gpu;
 	}
+	/* Where every shader lives, to place fault pointers (s8_shader sets
+	 * the name before parsing). */
+	s8_log("MTL shader %.40s: code 0x%llx+0x%x data 0x%llx+0x%x", s->name,
+	    (unsigned long long)s->code_gpu, s->code_size, (unsigned long long)s->data_gpu, s->data_size);
 #undef U32
 #undef NEED
 	/* The RSD template carries shader pointer 0: patch in the code. */
@@ -1751,7 +1755,10 @@ static int s8_dump_wanted(uint64_t size)
 	return size == (4u << 20) || size == S8_CHUNK || size <= (256u << 10);
 }
 
-static void s8_dump(uint64_t jc, unsigned slot)
+/* jc/slot: the failed chain; vt: the pass's vertex/tiler chain (the draws'
+ * descriptors); fault: the failed job's fault pointer, whose region is
+ * dumped first and whatever its size. Once per process. */
+static void s8_dump(uint64_t jc, unsigned slot, uint64_t vt, uint64_t fault)
 {
 	static int done;
 	if (done++)
@@ -1760,13 +1767,33 @@ static void s8_dump(uint64_t jc, unsigned slot)
 	void *cpu[64];
 	unsigned n = s8_mem_regions(gpu, cpu, size, 64), lines = 0;
 	s8_log("MTL dump begin: chain 0x%llx slot %u, %u regions", (unsigned long long)jc, slot, n);
+	s8_log("MTL dump vt chain 0x%llx fault 0x%llx", (unsigned long long)vt, (unsigned long long)fault);
+	/* the region holding the fault pointer first */
+	for (unsigned r = 1; r < n; r++) {
+		if (fault >= gpu[r] && fault < gpu[r] + size[r]) {
+			uint64_t g = gpu[r], s = size[r];
+			void *c = cpu[r];
+			gpu[r] = gpu[0], size[r] = size[0], cpu[r] = cpu[0];
+			gpu[0] = g, size[0] = s, cpu[0] = c;
+		}
+	}
 	for (unsigned r = 0; r < n; r++) {
-		s8_log("MTL dump region 0x%llx size 0x%llx%s", (unsigned long long)gpu[r],
-		    (unsigned long long)size[r], s8_dump_wanted(size[r]) ? "" : " (skipped)");
-		if (!s8_dump_wanted(size[r]))
+		int with_fault = fault >= gpu[r] && fault < gpu[r] + size[r];
+		int wanted = s8_dump_wanted(size[r]) || with_fault;
+		s8_log("MTL dump region 0x%llx size 0x%llx%s%s", (unsigned long long)gpu[r],
+		    (unsigned long long)size[r], wanted ? "" : " (skipped)", with_fault ? " (fault)" : "");
+		if (!wanted)
 			continue;
 		const volatile uint8_t *src = cpu[r];
-		for (uint64_t o = 0; o + S8_DUMP_BLOCK <= size[r] && lines < S8_DUMP_MAX_LINES;
+		/* a fault region up to 1 MiB whole (a shader's code), a bigger one
+		 * as 64 KiB around the fault, so the descriptors still fit */
+		uint64_t lo = 0, hi = size[r];
+		if (with_fault && size[r] > (1u << 20) && !s8_dump_wanted(size[r])) {
+			uint64_t at = fault - gpu[r];
+			lo = at > (64u << 10) ? (at - (64u << 10)) / S8_DUMP_BLOCK * S8_DUMP_BLOCK : 0;
+			hi = lo + (128u << 10) < size[r] ? lo + (128u << 10) : size[r];
+		}
+		for (uint64_t o = lo; o + S8_DUMP_BLOCK <= hi && lines < S8_DUMP_MAX_LINES;
 		    o += S8_DUMP_BLOCK) {
 			uint8_t b[S8_DUMP_BLOCK];
 			int any = 0;
@@ -1977,12 +2004,15 @@ int s8d_pass_execute(struct s8d_cmdbuf *cb, int idx)
 
 	if (p->draws && s8_submit(p->jc.first_job, 1, "vertex/tiler", p->draws, p->jobs, p->njobs) != 0) {
 		s8_log_layout(p);
-		s8_dump(p->jc.first_job, 1);
+		const volatile uint32_t *h = p->njobs ? p->jobs[0].cpu : NULL;
+		s8_dump(p->jc.first_job, 1, p->jc.first_job, h ? (h[2] | (uint64_t)h[3] << 32) : 0);
 		return -1;
 	}
 	uint64_t t1 = s8_now_ns();
 	if (s8_submit(p->fragment.gpu, 0, "fragment", p->draws, &p->fragment, 1) != 0) {
 		s8_log_layout(p);
+		const volatile uint32_t *h = p->fragment.cpu;     /* header: fault pointer at +8 */
+		s8_dump(p->fragment.gpu, 0, p->draws ? p->jc.first_job : 0, h[2] | (uint64_t)h[3] << 32);
 		return -1;
 	}
 	uint64_t t2 = s8_now_ns();

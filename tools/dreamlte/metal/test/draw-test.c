@@ -106,7 +106,16 @@ int ioctl(int fd, unsigned long req, ...)
 		 * then logs its dump) and save the memory as it is to FILE. */
 		const char *ref = getenv("S8_DUMP_REF");
 		static int failed;
-		if (ref && s->slot == 1 && !failed++) {
+		/* S8_DUMP_FAIL=frag: fail the first fragment chain instead, with a
+		 * fault pointer 4 KiB into the tiler heap (a region the dump skips
+		 * unless it holds the fault). */
+		const char *which = getenv("S8_DUMP_FAIL");
+		unsigned fail_slot = which && strcmp(which, "frag") == 0 ? 0 : 1;
+		if (ref && fail_slot == 0 && s->slot == 0 && !failed) {
+			uint64_t fp = region_gpu[0] + 0x1000;
+			memcpy(mem + (s->jc - S8T_BASE) + 8, &fp, 8);
+		}
+		if (ref && s->slot == fail_slot && !failed++) {
 			FILE *f = fopen(ref, "wb");
 			if (f) {
 				fwrite(mem, 1, used, f);
