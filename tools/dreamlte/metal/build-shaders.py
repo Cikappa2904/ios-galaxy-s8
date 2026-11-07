@@ -99,6 +99,8 @@ def main():
         todo = [f for f in funcs if only is None or f['name'] in only]
         if preload:
             todo.append({'name': '@preload'})   # the driver's render target reload shader
+            # the driver's self-test draws (s8d_selftest)
+            todo += [{'name': n} for n in ('@test_vs', '@test_fs', '@test_fs16', '@test_fbf')]
         have = {f['name'] for f in funcs}
         for fn, key in spec:
             if fn in have:

@@ -1045,8 +1045,13 @@ struct s8d_cmdbuf {
 	uint64_t vp_desc;               /* VIEWPORT for the current state, 0: rebuild */
 };
 
+static void s8d_selftest(void);
+
 struct s8d_cmdbuf *s8d_cmdbuf_new(void)
 {
+	static int selftested;
+	if (!__atomic_exchange_n(&selftested, 1, __ATOMIC_ACQ_REL))
+		s8d_selftest();
 	struct s8d_cmdbuf *cb = calloc(1, sizeof(*cb));
 	if (cb != NULL)
 		cb->current = -1;
@@ -2123,4 +2128,115 @@ int s8d_pass_execute(struct s8d_cmdbuf *cb, int idx)
 		    (unsigned long long)((t2 - t1) / 1000000), ids);
 	}
 	return 0;
+}
+
+/*
+ * Self-test on the GPU, once per process before the first command buffer:
+ * known inputs through the paths CoreAnimation's frames take, results
+ * logged against the expected BGRA8 texel (boot nocopy1: images came out
+ * noisy, one channel per pixel, colours wrong). Clear colour packing,
+ * texture sampling as float and as half (CoreAnimation's shaders work in
+ * half), render target reload (preload), framebuffer fetch (LD_TILE and
+ * its conversion), the private display formats 550/554 and A8 glyph
+ * textures.
+ */
+static void s8d_selftest(void)
+{
+#ifndef S8_TEST
+	if (s8d_init() != 0)
+		return;
+	enum { W = 64, H = 64 };
+	s8_mem rt, tex, a8, vb;
+	memset(&rt, 0, sizeof(rt));
+	memset(&tex, 0, sizeof(tex));
+	memset(&a8, 0, sizeof(a8));
+	memset(&vb, 0, sizeof(vb));
+	if (s8_mem_alloc(&rt, W * H * 4, 256) != 0 || s8_mem_alloc(&tex, 16 * 16 * 4, 256) != 0 ||
+	    s8_mem_alloc(&a8, 64 * 16, 256) != 0 || s8_mem_alloc(&vb, 64, 64) != 0) {
+		s8_log("MTL selftest: no memory");
+		goto out;
+	}
+	for (unsigned i = 0; i < 16 * 16; i++)
+		((volatile uint32_t *)tex.cpu)[i] = 0xc0804010;      /* B 0x10 G 0x40 R 0x80 A 0xc0 */
+	memset(a8.cpu, 0x80, 64 * 16);
+	static const float quad[16] = { -1, -1, 0, 1, 1, -1, 1, 1, -1, 1, 0, 0, 1, 1, 1, 0 };
+	memcpy(vb.cpu, quad, sizeof(quad));
+	static const char *const fs[3] = { "@test_fs", "@test_fs16", "@test_fbf" };
+	struct s8d_pipeline *pl[3];
+	for (unsigned i = 0; i < 3; i++) {
+		struct s8d_pipeline_desc d;
+		memset(&d, 0, sizeof(d));
+		d.vs_name = "@test_vs";
+		d.fs_name = fs[i];
+		d.vs_constants = d.fs_constants = "";
+		d.color_format = 80;
+		d.write_mask = 0xf;
+		d.attribs[0] = (struct s8d_vertex_attrib){ 29, 0, 0 };
+		d.attribs[1] = (struct s8d_vertex_attrib){ 29, 8, 0 };
+		d.layouts[0] = (struct s8d_vertex_layout){ 16, 1, 1 };
+		pl[i] = s8d_pipeline_new(&d, 9000 + i);
+	}
+	static const struct {
+		const char *name;
+		int pipe;
+		unsigned load;
+		double clear[4];
+		uint32_t texfmt, rtfmt, prefill, expect;
+	} t[] = {
+		{ "clear", -1, 2, { 0.25, 0.5, 0.75, 1 }, 0, 80, 0, 0xff4080bf },
+		{ "texture f32", 0, 2, { 0, 0, 0, 0 }, 80, 80, 0, 0xc0804010 },
+		{ "texture f16", 1, 2, { 0, 0, 0, 0 }, 80, 80, 0, 0xc0804010 },
+		{ "preload", -1, 1, { 0, 0, 0, 0 }, 0, 80, 0x11223344, 0x11223344 },
+		{ "fb fetch clear", 2, 2, { 0.25, 0.5, 0.75, 1 }, 0, 80, 0, 0xff4080bf },
+		{ "fb fetch preload", 2, 1, { 0, 0, 0, 0 }, 0, 80, 0x11223344, 0x11223344 },
+		{ "texture 550 to 554", 1, 2, { 0, 0, 0, 0 }, 550, 554, 0, 0xc0804010 },
+		{ "A8 texture", 1, 2, { 0, 0, 0, 0 }, 1, 80, 0, 0x80000000 },
+	};
+	unsigned good = 0;
+	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+		volatile uint32_t *px = rt.cpu;
+		for (unsigned k = 0; k < W * H; k++)
+			px[k] = t[i].prefill;
+		if (t[i].pipe >= 0 && pl[t[i].pipe] == NULL) {
+			s8_log("MTL selftest %s: no pipeline", t[i].name);
+			continue;
+		}
+		struct s8d_texture target = { rt.gpu, W, H, W * 4, t[i].rtfmt };
+		struct s8d_texture src = t[i].texfmt == 1 ? (struct s8d_texture){ a8.gpu, 16, 16, 64, 1 } :
+		    (struct s8d_texture){ tex.gpu, 16, 16, 64, t[i].texfmt ? t[i].texfmt : 80 };
+		struct s8d_sampler smp = { .normalized = 1 };
+		static const float one[4] = { 1, 1, 1, 1 };
+		struct s8d_cmdbuf *cb = calloc(1, sizeof(*cb));
+		if (cb == NULL)
+			break;
+		cb->current = -1;
+		int pass = s8d_pass_begin(cb, &target, t[i].load, t[i].clear);
+		if (t[i].pipe >= 0) {
+			s8d_set_pipeline(cb, pl[t[i].pipe]);
+			s8d_set_buffer(cb, S8D_STAGE_VERTEX, 0, vb.gpu, vb.cpu, 64);
+			s8d_set_bytes(cb, S8D_STAGE_VERTEX, 1, one, sizeof(one));
+			s8d_set_bytes(cb, S8D_STAGE_FRAGMENT, 0, one, sizeof(one));
+			s8d_set_texture(cb, S8D_STAGE_FRAGMENT, 0, &src);
+			s8d_set_sampler(cb, S8D_STAGE_FRAGMENT, 0, &smp);
+			s8d_set_viewport(cb, 0, 0, W, H, 0, 1);
+			s8d_draw(cb, 4, 0, 4, 1, 0, 0, NULL);
+		}
+		s8d_pass_end(cb);
+		int r = pass >= 0 ? s8d_pass_execute(cb, pass) : -1;
+		s8d_cmdbuf_free(cb);
+		uint32_t c = px[(H / 2) * W + W / 2], e = px[3 * W + 3];
+		bool ok = r == 0 && c == t[i].expect && e == t[i].expect;
+		good += ok;
+		s8_log("MTL selftest %s: %s run %d, %08x %08x, expected %08x", t[i].name, ok ? "OK" : "BAD", r, c, e,
+		    t[i].expect);
+	}
+	s8_log("MTL selftest: %u of %u OK", good, (unsigned)(sizeof(t) / sizeof(t[0])));
+	for (unsigned i = 0; i < 3; i++)
+		s8d_pipeline_free(pl[i]);
+out:
+	s8_mem_free(&rt);
+	s8_mem_free(&tex);
+	s8_mem_free(&a8);
+	s8_mem_free(&vb);
+#endif
 }

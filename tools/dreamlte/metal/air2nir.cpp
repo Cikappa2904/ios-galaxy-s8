@@ -1808,11 +1808,46 @@ static nir_variable *test_var(nir_shader *s, nir_variable_mode mode, const char 
 	return v;
 }
 
-static nir_shader *test_shader(bool vertex)
+/* mode: 0 "@test_vs", 1 "@test_fs", 2 "@test_fs16" (texture sampled and
+ * written as half floats, like CoreAnimation's shaders), 3 "@test_fbf"
+ * (framebuffer fetch: the colour already there, as half, times constant
+ * buffer 0, so LD_TILE and its conversion are tested). The driver's
+ * self-test (s8d_selftest) draws with them on the phone. */
+static nir_shader *test_shader(int mode)
 {
+	bool vertex = mode == 0;
 	nir_builder b = nir_builder_init_simple_shader(vertex ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT,
 	    pan_shader_get_compiler_options(6), vertex ? "s8-test-vs" : "s8-test-fs");
 	nir_def *k = s8_load_ubo(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0), 16);
+	if (mode == 2 || mode == 3) {
+		const glsl_type *h4 = glsl_vector_type(GLSL_TYPE_FLOAT16, 4);
+		nir_def *v;
+		if (mode == 3) {
+			nir_variable *fb = test_var(b.shader, nir_var_shader_out, "fb", h4, FRAG_RESULT_DATA0);
+			fb->data.fb_fetch_output = true;
+			b.shader->info.outputs_read |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+			b.shader->info.fs.uses_fbfetch_output = true;
+			v = nir_load_var(&b, fb);
+		} else {
+			nir_variable *in = test_var(b.shader, nir_var_shader_in, "tc", glsl_vec_type(2), VARYING_SLOT_VAR0);
+			in->data.interpolation = INTERP_MODE_SMOOTH;
+			nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+			tex->op = nir_texop_tex;
+			tex->dest_type = nir_type_float16;
+			tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+			tex->coord_components = 2;
+			tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_load_var(&b, in));
+			tex->texture_index = 0;
+			tex->sampler_index = 0;
+			nir_def_init(&tex->instr, &tex->def, 4, 16);
+			nir_builder_instr_insert(&b, &tex->instr);
+			b.shader->info.num_textures = 1;
+			v = &tex->def;
+		}
+		nir_store_var(&b, test_var(b.shader, nir_var_shader_out, "color", h4, FRAG_RESULT_DATA0),
+		    nir_fmul(&b, v, nir_f2f16(&b, k)), 0xf);
+		return b.shader;
+	}
 	if (vertex) {
 		nir_def *pos = nir_load_var(&b, test_var(b.shader, nir_var_shader_in, "pos", glsl_vec_type(2),
 		    VERT_ATTRIB_GENERIC0));
@@ -1909,9 +1944,9 @@ int main(int argc, char **argv)
 		/* the driver's frame shader for MTLLoadActionLoad (lib = unused) */
 		stage = MESA_SHADER_FRAGMENT;
 		s = preload_shader();
-	} else if (fname == "@test_vs" || fname == "@test_fs") {
+	} else if (fname == "@test_vs" || fname == "@test_fs" || fname == "@test_fs16" || fname == "@test_fbf") {
 		stage = fname == "@test_vs" ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT;
-		s = test_shader(stage == MESA_SHADER_VERTEX);
+		s = test_shader(fname == "@test_vs" ? 0 : fname == "@test_fs" ? 1 : fname == "@test_fs16" ? 2 : 3);
 	} else {
 		MetallibFunction *fn = nullptr;
 		funcs = read_metallib(lib);
