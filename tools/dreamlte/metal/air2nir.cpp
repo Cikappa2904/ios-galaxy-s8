@@ -857,6 +857,14 @@ nir_shader *Translator::run()
 			nir_variable *v = io_var(nir_var_system_value, "frag_coord", glsl_vec4_type(), SYSTEM_VALUE_FRAG_COORD);
 			(void)v;
 			vals[&arg] = { nir_load_frag_coord(&b) };
+		} else if (a.kind == "air.render_target" && a.render_target > 0) {
+			/* Passes have one colour attachment (s8mtl_draw.c), and a
+			 * tile read of a render target the framebuffer descriptor
+			 * lacks faulted INSTR_INVALID_ENC on the G71 (LD_TILE rt 1 in
+			 * fixed_frag_lph_cpf, found by the loader bisection): colour
+			 * attachments past 0 read as zero. */
+			const glsl_type *gt = glsl(t);
+			vals[&arg] = { nir_imm_zero(&b, glsl_get_vector_elements(gt), glsl_get_bit_size(gt)) };
 		} else if (a.kind == "air.render_target") {
 			/* framebuffer fetch */
 			nir_variable *v = io_var(nir_var_shader_out, "fb", glsl(t), FRAG_RESULT_DATA0 + a.render_target);
@@ -939,6 +947,8 @@ void Translator::store_return(const Value *rv)
 		const glsl_type *t = glsl_vector_type(v->bit_size == 16 ? GLSL_TYPE_FLOAT16 :
 		    (v->bit_size == 1 ? GLSL_TYPE_BOOL : GLSL_TYPE_FLOAT), v->num_components);
 		nir_variable *var = nullptr;
+		if (r.kind == "air.render_target" && r.render_target > 0)
+			continue;       /* one colour attachment: no writes past 0 (no BLEND for RT > 0) */
 		if (r.kind == "air.position")
 			var = io_var(nir_var_shader_out, "position", glsl_vec4_type(), VARYING_SLOT_POS);
 		else if (r.kind == "air.vertex_output")
