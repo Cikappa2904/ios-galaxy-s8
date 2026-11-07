@@ -16,10 +16,27 @@ in FINE_LO..FINE_HI (qwords), branch-free clauses only.
   dump2bisect.py MEM.bin MEM_BASE CACHE_DIS.txt SHADER CODE_GPU VT_JC FRAG_JC \
                  TARGET_VA TARGET_SIZE FINE_LO FINE_HI OUT.h TILER_CTX
 """
-import re, struct, sys
+import os, re, struct, sys
 
 sys.path.insert(0, __import__('os').path.dirname(__file__))
 from probes import end_clause  # noqa: E402
+
+FIELDS = {'p': (16, 1), 'm': (40, 5), 'w': (24, 8), 's': (17, 1)}
+
+
+def clear_header(clause, how):
+    """Header bits as probes.end_clause, clearing only the named fields."""
+    c = bytearray(clause)
+    w2, w3 = struct.unpack_from('<II', c, 8)
+    tag = struct.unpack_from('<I', c, 0)[0] & 0xff
+    h = ((w2 >> 19) | (w3 << 13)) & ((1 << 45) - 1)
+    for f in how:
+        lo, n = FIELDS[f]
+        h &= ~(((1 << n) - 1) << lo)
+    w2 = (w2 & ((1 << 19) - 1)) | ((h & ((1 << 13) - 1)) << 19)
+    struct.pack_into('<II', c, 8, w2, h >> 13)
+    return bytes(c), tag
+
 
 BASE = 0x8c1000000          # loader range base: the GPU heap of the 1 GiB layout
 TARGET_PA = 0x8c4000000     # spare RAM for the render target, inside the range
@@ -56,7 +73,16 @@ def main():
         target = last * i // (COARSE + 1)
         pick.add(min((c for c in starts if c >= target), default=starts[-1]))
     pick |= {c for c in starts if fine_lo <= c <= fine_hi}
-    cuts = sorted(pick)
+    if os.environ.get('S8_CUTS'):       # "LO-HI": every branch-free clause start in that range, only
+        lo, hi = (int(x) for x in os.environ['S8_CUTS'].split('-'))
+        pick = {c for c in starts if lo <= c <= hi}
+    cuts = [(c, 'end') for c in sorted(pick)]
+    # S8_HDR "Q:FIELDS,...": clause Q left running, its header with FIELDS cleared
+    # (p next clause prefetch, m next message type, w dependency wait, s staging barrier)
+    for spec in filter(None, os.environ.get('S8_HDR', '').split(',')):
+        q_, f_ = spec.split(':')
+        assert int(q_) in {c for c, _ in clauses}, f'no clause_{q_}'
+        cuts.append((int(q_), f_))
 
     # pages the GPU writes in a run (job headers, framebuffer/tiler descriptors): refreshed per variant
     jobs = []
@@ -110,8 +136,8 @@ def main():
         rec.extend(label.encode()[:31].ljust(32, b'\0'))
 
     nsub = 0
-    for cut in [None] + cuts:
-        label = 'ctl' if cut is None else f'c{cut}'
+    for cut, how in [(None, None)] + cuts:
+        label = 'ctl' if cut is None else (f'c{cut}' if how == 'end' else f'h{cut}{how}')
         patched = None
         if cut is not None:
             a = code_gpu + cut * 16
@@ -119,7 +145,7 @@ def main():
             p = bytearray(mem[o:o + 4096])
             off = (a - mem_base) & 4095
             assert off + 16 <= 4096, 'clause header across a page'
-            head, tag = end_clause(bytes(p[off:off + 16]))
+            head, tag = end_clause(bytes(p[off:off + 16])) if how == 'end' else                 clear_header(bytes(p[off:off + 16]), how)
             assert (tag >> 3) & 7 in (1, 5), f'clause_{cut}: first quadword not format 0 (tag {tag:#x})'
             p[off:off + 16] = head
             page(o, p)
@@ -139,9 +165,8 @@ def main():
         for o in range(0, len(rec), 16):
             f.write(' ' + ', '.join(f'0x{x:02x}' for x in rec[o:o + 16]) + ',\n')
         f.write('};\n')
-    print(f'{out}: {len(rec)} bytes, {npages} pages, {len(cuts)} cuts ({sum(1 for c in cuts if fine_lo <= c <= fine_hi)} '
-          f'fine), {nsub} submits; refresh pages {[hex(mem_base + o) for o in refresh]}; range 0x{BASE:x}+0x{end - BASE:x}')
-    print('cuts:', ' '.join(map(str, cuts)))
+    print(f'{out}: {len(rec)} bytes, {npages} pages, {len(cuts)} variants, {nsub} submits; refresh pages {[hex(mem_base + o) for o in refresh]}; range 0x{BASE:x}+0x{end - BASE:x}')
+    print('variants:', ' '.join(f'{c}{"" if h == "end" else ":" + h}' for c, h in cuts))
 
 
 if __name__ == '__main__':
