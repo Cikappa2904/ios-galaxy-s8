@@ -64,6 +64,16 @@ struct s8d_pipeline_desc {
 struct s8d_pipeline;
 struct s8d_cmdbuf;
 
+/* FNV-1a over a function-constant key: specialised shaders are cached as
+ * "function@%016llx" of their exact key (build-shaders.py --spec). */
+static inline uint64_t s8d_key_hash(const char *s)
+{
+	uint64_t h = 0xcbf29ce484222325ULL;
+	while (s != 0 && *s)
+		h = (h ^ (uint8_t)*s++) * 0x100000001b3ULL;
+	return h;
+}
+
 /* 0 when the shader cache and the GPU are usable (logged once otherwise). */
 int s8d_init(void);
 /* NULL when a shader is missing from the cache (the reason is logged). */

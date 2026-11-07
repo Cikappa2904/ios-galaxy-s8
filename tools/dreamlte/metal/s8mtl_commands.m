@@ -214,6 +214,54 @@ static void s8_cpu_clear(S8Texture *t, MTLClearColor c)
 	}
 }
 
+/*
+ * Screen thumbnails in the log (test/shot2png.py makes PNGs of them): the
+ * display composite (a 1440x2960 BGRA target) at 20, 50, 100 and 180 s
+ * after the first one, 16x16 blocks averaged over 4x4 samples, 6 bits per
+ * channel, base64 (3 characters a pixel), 30 pixels a line.
+ */
+static void s8_shot(S8Texture *t)
+{
+	static uint64_t t0;
+	static unsigned shots;
+	static const unsigned at[] = { 20, 50, 100, 180 };
+	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (t == nil || t->_cpu == NULL || t->_width < 1000 || t->_height < 2000 || s8_format_bpp(t->_format) != 4 ||
+	    shots >= sizeof(at) / sizeof(at[0]))
+		return;
+	uint64_t now = s8_now_ns();
+	if (t0 == 0)
+		t0 = now;
+	if (now - t0 < (uint64_t)at[shots] * 1000000000ULL)
+		return;
+	shots++;
+	unsigned bw = (unsigned)t->_width / 16, bh = (unsigned)t->_height / 16;
+	NSUInteger rb = t->_rowBytes ? t->_rowBytes : t->_width * 4;
+	s8_log("MTL shot %u: %ux%u of %lux%lu fmt %lu at %llu s", shots, bw, bh, (unsigned long)t->_width,
+	    (unsigned long)t->_height, (unsigned long)t->_format, (unsigned long long)((now - t0) / 1000000000ULL));
+	for (unsigned by = 0; by < bh; by++) {
+		char line[100];
+		unsigned n = 0, part = 0;
+		for (unsigned bx = 0; bx < bw; bx++) {
+			unsigned sum[3] = { 0, 0, 0 };
+			for (unsigned sy = 0; sy < 4; sy++)
+				for (unsigned sx = 0; sx < 4; sx++) {
+					const uint8_t *px = t->_cpu + (by * 16 + sy * 4 + 2) * rb + (bx * 16 + sx * 4 + 2) * 4;
+					sum[0] += px[2];        /* BGRA in memory */
+					sum[1] += px[1];
+					sum[2] += px[0];
+				}
+			for (int c = 0; c < 3; c++)
+				line[n++] = b64[(sum[c] / 16) >> 2];
+			if (n == 90 || bx + 1 == bw) {
+				line[n] = 0;
+				s8_log("MTL shot %u %u %u: %s", shots, by, part++, line);
+				n = 0;
+			}
+		}
+	}
+}
+
 - (void)s8_execute
 {
 	unsigned draws = 0, clears = 0, blits = 0, gpu = 0;
@@ -223,6 +271,7 @@ static void s8_cpu_clear(S8Texture *t, MTLClearColor c)
 			draws += p->draws;
 			if (p->gpu >= 0 && s8d_pass_execute(_draw, p->gpu) == 0) {
 				gpu++;
+				s8_shot(p->target);
 			} else if (p->load == MTLLoadActionClear) {
 				s8_cpu_clear(p->target, p->clear);
 				clears++;

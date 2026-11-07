@@ -245,14 +245,32 @@ static id s8_error(const char *what)
 	s8_log("MTL pipeline %u: vs %s fs %s fmt %lu blend %d", p->_id,
 	    vs ? [vs->_name UTF8String] : "-", fs ? [fs->_name UTF8String] : "-",
 	    (unsigned long)p->_colorFormat, p->_blending);
-	/* the full constant sets, in log-line-sized pieces */
+	/*
+	 * The exact constant sets, once per process each, for build-shaders.py
+	 * --spec (test/fc2spec.py reads them back). Pieces fit the 119
+	 * characters of a log line: "MTL fc <16 hex>+<off>: " and 80 of the key
+	 * (the 96-character pieces of boot mps1 lost their last 8).
+	 */
 	for (int which = 0; which < 2; which++) {
+		static uint64_t seen[256];
+		static unsigned nseen;
 		S8Function *fn = which ? fs : vs;
 		if (fn == nil || !fn->_constants[0])
 			continue;
 		size_t len = strlen(fn->_constants);
-		for (size_t o = 0; o < len; o += 96)
-			s8_log("MTL pipeline %u %s consts+%zu: %.96s", p->_id, which ? "fs" : "vs", o, fn->_constants + o);
+		uint64_t h = s8d_key_hash(fn->_constants);
+		unsigned k;
+		for (k = 0; k < nseen && seen[k] != h; k++)
+			;
+		if (k < nseen)
+			continue;
+		if (nseen < 256)
+			seen[nseen++] = h;
+		s8_log("MTL fc %016llx: pipeline %u %s %.40s, %zu chars%s", (unsigned long long)h, p->_id,
+		    which ? "fs" : "vs", [fn->_name UTF8String], len,
+		    len + 1 >= sizeof(fn->_constants) ? " TRUNCATED" : "");
+		for (size_t o = 0; o < len; o += 80)
+			s8_log("MTL fc %016llx+%zu: %.80s", (unsigned long long)h, o, fn->_constants + o);
 	}
 	/* GPU pipeline (stage 3) */
 	struct s8d_pipeline_desc d;

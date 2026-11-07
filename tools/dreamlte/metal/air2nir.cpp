@@ -57,6 +57,7 @@
 #include <llvm/Transforms/IPO/GlobalOpt.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
 #include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
 
 #include <cstdio>
@@ -218,8 +219,19 @@ static void make_dynamic(Module &m, Function &entry)
 		f.setSection("");
 		f.setLinkage(GlobalValue::InternalLinkage);
 		IRBuilder<> b(&*entry.getEntryBlock().getFirstInsertionPt());
-		b.CreateCall(&f);
+		CallInst *call = b.CreateCall(&f);
+		call->setCallingConv(f.getCallingConv());
+		InlineFunctionInfo ifi;
+		InlineResult ir = InlineFunction(*call, ifi);
+		if (!ir.isSuccess())
+			fail(std::string("cannot inline the static initialiser: ") + ir.getFailureReason());
 	}
+	/* ... and nothing else: llvm.global_ctors kept the initialiser's own
+	 * body alive, and localise_globals then repointed its stores at the
+	 * entry point's allocas across functions (invalid IR the O2 pipeline
+	 * happened to survive, and crashed on with -F). */
+	if (GlobalVariable *ctors = m.getGlobalVariable("llvm.global_ctors"))
+		ctors->eraseFromParent();
 }
 
 /* Point the users of old (a global's address or a GEP of it) at new, a
@@ -303,6 +315,24 @@ static void localise_globals(Module &m, Function &entry)
 	for (const char *keep : { "llvm.used", "llvm.compiler.used" })
 		if (GlobalVariable *g = m.getGlobalVariable(keep))
 			g->eraseFromParent();
+	/* The inlined functions' own bodies are dead now; they would keep
+	 * using the globals, and repointing those uses at the entry point's
+	 * allocas made invalid IR (instructions of one function using
+	 * another's values: the verifier's "does not dominate all uses").
+	 * The O2 pipeline used to drop them before anything noticed; with
+	 * folded constants (-F) it crashed instead. */
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (Function &f : make_early_inc_range(m)) {
+			if (&f == &entry || f.isDeclaration())
+				continue;
+			f.removeDeadConstantUsers();
+			if (f.use_empty()) {
+				f.eraseFromParent();
+				changed = true;
+			}
+		}
+	}
 	std::vector<GlobalVariable *> gvs;
 	for (GlobalVariable &gv : m.globals())
 		if (!gv.isConstant() && gv.hasLocalLinkage())
@@ -319,6 +349,72 @@ static void localise_globals(Module &m, Function &entry)
 			eb.CreateStore(gv->getInitializer(), a);
 		repoint(gv, a);
 	}
+}
+
+/*
+ * -D -F: the run-time constant reads of -D (s8.fcdef / s8.fc.*) become the
+ * values a key gives, exactly as the driver would fill UBO S8_UBO_FC from
+ * it (s8_fc_ubo: the value's 8 bytes little endian, "defined" when the key
+ * names the constant, zero otherwise). A specialisation is then the same
+ * program as the generic shader running with that key, folded.
+ */
+static bool fold_mode;
+static std::map<std::string, uint64_t> fold_values;
+
+static Constant *fold_value(Type *t, uint64_t bits)
+{
+	auto *vt = dyn_cast<FixedVectorType>(t);
+	Type *et = vt ? vt->getElementType() : t;
+	unsigned n = vt ? vt->getNumElements() : 1;
+	unsigned eb = et->getPrimitiveSizeInBits(), eb_store = eb == 1 ? 8 : eb;
+	std::vector<Constant *> elems;
+	for (unsigned i = 0; i < n; i++) {
+		unsigned shift = i * eb_store;
+		uint64_t v = shift < 64 ? bits >> shift : 0;
+		if (eb_store < 64)
+			v &= (1ull << eb_store) - 1;
+		Constant *c;
+		if (et->isIntegerTy())
+			c = ConstantInt::get(et, eb == 1 ? (v != 0) : v);
+		else if (et->isHalfTy() || et->isFloatTy() || et->isDoubleTy())
+			c = ConstantFP::get(t->getContext(), APFloat(et->isHalfTy() ? APFloat::IEEEhalf() :
+			    et->isFloatTy() ? APFloat::IEEEsingle() : APFloat::IEEEdouble(), APInt(eb, v)));
+		else
+			fail("folded function constant of unsupported type");
+		elems.push_back(c);
+	}
+	return vt ? ConstantVector::get(elems) : elems[0];
+}
+
+static void fold_dynamic(Module &m)
+{
+	std::map<unsigned, std::string> names;
+	for (auto &dc : dynamic_constants)
+		names[dc.index] = dc.name;
+	std::vector<CallInst *> calls;
+	for (Function &f : m)
+		if (f.getName() == "s8.fcdef" || f.getName().starts_with("s8.fc."))
+			for (User *u : f.users())
+				if (auto *ci = dyn_cast<CallInst>(u))
+					calls.push_back(ci);
+	for (CallInst *ci : calls) {
+		unsigned index = (unsigned)cast<ConstantInt>(ci->getArgOperand(0))->getZExtValue();
+		auto it = names.find(index);
+		bool defined = it != names.end() && fold_values.count(it->second) != 0;
+		uint64_t bits = defined ? fold_values[it->second] : 0;
+		Constant *c = ci->getCalledFunction()->getName() == "s8.fcdef" ?
+		    ConstantInt::getBool(m.getContext(), defined) : fold_value(ci->getType(), bits);
+		ci->replaceAllUsesWith(c);
+		ci->eraseFromParent();
+	}
+	for (auto &[name, v] : fold_values) {
+		bool known = false;
+		for (auto &dc : dynamic_constants)
+			known |= dc.name == name;
+		if (!known)
+			fprintf(stderr, "air2nir: note: constant %s is not the function's\n", name.c_str());
+	}
+	dynamic_constants.clear();      /* nothing left to read at run time */
 }
 
 static void specialise(Module &m, Function &entry, const std::vector<ConstantValue> &values, bool dynamic)
@@ -356,6 +452,14 @@ static void specialise(Module &m, Function &entry, const std::vector<ConstantVal
 			fpm.run(entry, fam);
 		}
 		localise_globals(m, entry);
+		/* After localise_globals, which expects the -D program's entry
+		 * block as it is (folding first left its allocas after their
+		 * stores); the O2 pipeline below then drops the dead paths. */
+		if (fold_mode) {
+			for (auto &v : values)
+				fold_values[v.name] = v.bits;
+			fold_dynamic(m);
+		}
 	}
 
 	LLVMContext &ctx = m.getContext();
@@ -999,6 +1103,12 @@ static nir_def *s8_dot(nir_builder *b, nir_def *x, nir_def *y) { return nir_fdot
 static nir_def *s8_any(nir_builder *b, nir_def *x) { return nir_bany(b, x); }
 static nir_def *s8_all(nir_builder *b, nir_def *x) { return nir_ball(b, x); }
 static nir_def *s8_tan(nir_builder *b, nir_def *x) { return nir_fdiv(b, nir_fsin(b, x), nir_fcos(b, x)); }
+static nir_def *s8_fmax3(nir_builder *b, nir_def *x, nir_def *y, nir_def *z) { return nir_fmax(b, nir_fmax(b, x, y), z); }
+static nir_def *s8_fmin3(nir_builder *b, nir_def *x, nir_def *y, nir_def *z) { return nir_fmin(b, nir_fmin(b, x, y), z); }
+static nir_def *s8_fmedian3(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
+{
+	return nir_fmax(b, nir_fmin(b, x, y), nir_fmin(b, nir_fmax(b, x, y), z));
+}
 
 void Translator::emit_air(CallInst &ci, StringRef name)
 {
@@ -1025,6 +1135,8 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 	};
 	static const std::map<std::string, triop> triops = {
 		{ "mix", s8_fmix }, { "clamp", s8_fclamp }, { "fma", s8_fma }, { "smoothstep", s8_smoothstep },
+		{ "fmax3", s8_fmax3 }, { "fmin3", s8_fmin3 }, { "fmedian3", s8_fmedian3 },
+		{ "max3", s8_fmax3 }, { "min3", s8_fmin3 }, { "median3", s8_fmedian3 },
 	};
 
 	std::string bs = base.str();
@@ -1046,6 +1158,19 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 		else if (bs == "pack" && kind == "snorm4x8") r = nir_pack_snorm_4x8(&b, nir_f2f32(&b, x));
 		else if (bs == "pack" && kind == "unorm2x16") r = nir_pack_unorm_2x16(&b, nir_f2f32(&b, x));
 		else if (bs == "pack" && kind == "snorm2x16") r = nir_pack_snorm_2x16(&b, nir_f2f32(&b, x));
+		else if (bs == "pack" && kind == "unorm" && name.contains(".rgb565.")) {
+			/* air.pack.unorm.rgb565: red in the top 5 bits (B5G6R5 memory order) */
+			nir_def *f = nir_fsat(&b, nir_f2f32(&b, x));
+			nir_def *q = nir_f2u32(&b, nir_fround_even(&b, nir_fmul(&b, f, nir_imm_vec3(&b, 31.0, 63.0, 31.0))));
+			nir_def *v = nir_ior(&b, nir_ishl_imm(&b, nir_channel(&b, q, 0), 11),
+			    nir_ior(&b, nir_ishl_imm(&b, nir_channel(&b, q, 1), 5), nir_channel(&b, q, 2)));
+			r = nir_u2uN(&b, v, bits(ci.getType()));
+		} else if (bs == "unpack" && kind == "unorm" && name.contains(".rgb565.")) {
+			nir_def *v = nir_u2u32(&b, x);
+			nir_def *q = nir_vec3(&b, nir_ubitfield_extract_imm(&b, v, 11, 5),
+			    nir_ubitfield_extract_imm(&b, v, 5, 6), nir_ubitfield_extract_imm(&b, v, 0, 5));
+			r = nir_fmul(&b, nir_u2f32(&b, q), nir_imm_vec3(&b, 1.0 / 31, 1.0 / 63, 1.0 / 31));
+		}
 		else
 			unsupported.push_back(name.str());
 	} else if (bs == "convert") {
@@ -1066,12 +1191,16 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 			r = nir_type_convert(&b, x, (nir_alu_type)(src_t | x->bit_size), (nir_alu_type)(dst_t | db),
 			    nir_rounding_mode_undef);
 	} else if (bs == "sample_texture_2d" || bs == "sample_texture_3d" || bs == "sample_texture_cube" ||
-	    bs == "read_texture_2d" || bs == "sample_texture_2d_array") {
+	    bs == "read_texture_2d" || bs == "sample_texture_2d_array" || bs == "sample_texture_1d") {
+		/* 1D textures are Wx1 2D textures for the driver: sampled at y = 0.5 */
+		bool one_d = bs == "sample_texture_1d";
 		bool read = bs.starts_with("read");
 		nir_def *tex_idx = nir_u2u32(&b, def(ci.getArgOperand(0)));
 		nir_def *samp_idx = read ? nir_imm_int(&b, 0) : nir_u2u32(&b, def(ci.getArgOperand(1)));
 		unsigned dim_n = bs == "sample_texture_3d" || bs == "sample_texture_cube" ? 3 : 2;
 		nir_def *coord = arg(read ? 1 : 2);
+		if (one_d)
+			coord = nir_vec2(&b, nir_f2f32(&b, nir_channel(&b, coord, 0)), nir_imm_float(&b, 0.5f));
 		/* sample_texture_*(tex, sampler, coord, i1, offset, i1 explicit_lod,
 		 * float bias_or_lod, float min_lod, i32 access) */
 		nir_texop op = nir_texop_tex;
@@ -1090,7 +1219,10 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 				op = nir_texop_txb;
 				lod = nir_f2f32(&b, def(bv));
 			}
-			if (!isa<ConstantAggregateZero>(ci.getArgOperand(4)))
+			if (one_d) {
+				if (!isa<ConstantInt>(ci.getArgOperand(4)) || !cast<ConstantInt>(ci.getArgOperand(4))->isZero())
+					offset = nir_vec2(&b, nir_i2i32(&b, nir_channel(&b, arg(4), 0)), nir_imm_int(&b, 0));
+			} else if (!isa<ConstantAggregateZero>(ci.getArgOperand(4)))
 				offset = nir_i2i32(&b, arg(4));
 			if (stage != MESA_SHADER_FRAGMENT && op == nir_texop_tex) {
 				op = nir_texop_txl;
@@ -1714,7 +1846,8 @@ int main(int argc, char **argv)
 	if (argc < 4) {
 		fprintf(stderr, "usage: air2nir METALLIB FUNCTION OUT [-v name,name,...] [-c name=bits ...] "
 		    "[-d] [-D]\n"
-		    "  -v: varying table, entries name or name=slot; -D: function constants at run time\n");
+		    "  -v: varying table, entries name or name=slot; -D: function constants at run time;\n"
+		    "  -D -F: the -c values folded into the -D program (specialisations)\n");
 		return 2;
 	}
 	std::string lib = argv[1], fname = argv[2], out = argv[3];
@@ -1742,6 +1875,8 @@ int main(int argc, char **argv)
 			dump = true;
 		} else if (a == "-D") {
 			dynamic = true;
+		} else if (a == "-F") {
+			fold_mode = true;
 		}
 	}
 	glsl_type_singleton_init_or_ref();

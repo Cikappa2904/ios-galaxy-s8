@@ -237,6 +237,7 @@ static struct {
 	struct s8_arena pipelines;      /* per-pipeline constant memory */
 	unsigned core_id_range, threads_per_core;
 	uint32_t tiler_features;
+	bool no_spec;                   /* boot-arg s8spec=0: generic shaders only */
 } s8g = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static uint32_t rd32(const uint8_t *p)
@@ -348,7 +349,7 @@ static int s8_parse_shader(struct s8_shader *s, const uint8_t *b, uint32_t size)
 	return 0;
 }
 
-static struct s8_shader *s8_shader(const char *name)
+static struct s8_shader *s8_shader_find(const char *name, bool quiet)
 {
 	if (name == NULL)
 		return NULL;
@@ -368,8 +369,35 @@ static struct s8_shader *s8_shader(const char *name)
 		}
 		return s->bad ? NULL : s;
 	}
-	s8_log("MTL shader %s: not in the cache", name);
+	if (!quiet)
+		s8_log("MTL shader %s: not in the cache", name);
 	return NULL;
+}
+
+static struct s8_shader *s8_shader(const char *name)
+{
+	return s8_shader_find(name, false);
+}
+
+/*
+ * A function with constants: its specialisation when the cache has one
+ * (constants folded at build time: CoreAnimation's uber shader is 366 KiB
+ * generic, far smaller specialised), else the generic shader that reads
+ * them from UBO 29.
+ */
+static struct s8_shader *s8_shader_for(const char *name, const char *constants, bool *spec)
+{
+	*spec = false;
+	if (name != NULL && constants != NULL && constants[0] && !s8g.no_spec) {
+		char key[64];
+		snprintf(key, sizeof(key), "%.40s@%016llx", name, (unsigned long long)s8d_key_hash(constants));
+		struct s8_shader *s = s8_shader_find(key, true);
+		if (s != NULL) {
+			*spec = true;
+			return s;
+		}
+	}
+	return s8_shader(name);
 }
 
 /* ---- device ---- */
@@ -391,6 +419,10 @@ int s8d_init(void)
 		s8_log("MTL draw: off (s8draw=0)");
 		goto out;
 	}
+	/* s8spec=0: never use the cache's specialisations (s8_shader_for) */
+	s8g.no_spec = strstr(args, "s8spec=0") != NULL;
+	if (s8g.no_spec)
+		s8_log("MTL draw: specialised shaders off (s8spec=0)");
 #endif
 	struct s8mali_info info = { 0 };
 	if (s8_fd() < 0 || ioctl(s8_fd(), S8MALI_INFO, &info) != 0 || !info.ready) {
@@ -523,6 +555,10 @@ static enum pipe_format s8_pixel_format(uint32_t mtl)
 	 * BGRA8, and the kernel presents their 'b3a8' surfaces as BGRA. */
 	case 550:
 	case 554: return PIPE_FORMAT_B8G8R8A8_UNORM;
+	/* 542: chronod's lock screen widget surfaces ('_RB4', two planes like
+	 * 'b3a8', 4 bytes a pixel in plane 0: 2048 bytes a row at 510 wide);
+	 * boot mps1 skipped every pass on them. Stored as BGRA8 too. */
+	case 542: return PIPE_FORMAT_B8G8R8A8_UNORM;
 	case 551:
 	case 555: return PIPE_FORMAT_B8G8R8A8_SRGB;
 	default: return PIPE_FORMAT_NONE;
@@ -819,8 +855,11 @@ struct s8d_pipeline *s8d_pipeline_new(const struct s8d_pipeline_desc *d, unsigne
 	struct s8d_pipeline *p = calloc(1, sizeof(*p));
 	const char *why = NULL;
 	p->id = id;
-	p->vs = s8_shader(d->vs_name);
-	p->fs = d->fs_name ? s8_shader(d->fs_name) : NULL;
+	bool vspec, fspec = false;
+	p->vs = s8_shader_for(d->vs_name, d->vs_constants, &vspec);
+	p->fs = d->fs_name ? s8_shader_for(d->fs_name, d->fs_constants, &fspec) : NULL;
+	if (vspec || fspec)
+		s8_log("MTL pipeline %u: specialised%s%s", id, vspec ? " vs" : "", fspec ? " fs" : "");
 	p->color = s8_pixel_format(d->color_format);
 	if (p->vs == NULL || (d->fs_name != NULL && p->fs == NULL)) {
 		why = "shader missing";
@@ -966,6 +1005,8 @@ struct s8_pass {
 	struct s8_ptr tiler_ctx, tiler_heap, tls, fragment, preload_dcd;
 	uint32_t tls_size;
 	unsigned skipped;
+#define S8_PASS_PIPES 8
+	unsigned pipes[S8_PASS_PIPES], npipes;  /* pipelines drawn with (slow pass log) */
 #define S8_LOG_JOBS 8
 	struct s8_ptr jobs[S8_LOG_JOBS];        /* first vertex/tiler jobs */
 	unsigned njobs;
@@ -1492,6 +1533,13 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 	if (pl == NULL || pl->fs == NULL) {
 		p->skipped++;
 		return;
+	}
+	{
+		unsigned k;
+		for (k = 0; k < p->npipes && p->pipes[k] != pl->id; k++)
+			;
+		if (k == p->npipes && k < S8_PASS_PIPES)
+			p->pipes[p->npipes++] = pl->id;
 	}
 	if (pl->color != p->format && logged++ < 20)
 		s8_log("MTL draw: pipeline %u format %d on a format %d target", pl->id, pl->color, p->format);
@@ -2046,5 +2094,16 @@ int s8d_pass_execute(struct s8d_cmdbuf *cb, int idx)
 		s8_log("MTL pass %ux%u fmt %u load %u: %u draws (%u skipped), vt %llu us, frag %llu us",
 		    w, h, p->target.format, p->load, p->draws, p->skipped,
 		    (unsigned long long)((t1 - t0) / 1000), (unsigned long long)((t2 - t1) / 1000));
+	/* which pipelines make a pass slow (the uber shader's specialisations) */
+	static unsigned slow_logged;
+	if (t2 - t1 > 50000000ULL && slow_logged++ < 60) {
+		char ids[80];
+		int n = 0;
+		ids[0] = 0;
+		for (unsigned k = 0; k < p->npipes && n >= 0 && n < (int)sizeof(ids) - 8; k++)
+			n += snprintf(ids + n, sizeof(ids) - n, " %u", p->pipes[k]);
+		s8_log("MTL slow pass %ux%u: frag %llu ms, pipelines%s", w, h,
+		    (unsigned long long)((t2 - t1) / 1000000), ids);
+	}
 	return 0;
 }

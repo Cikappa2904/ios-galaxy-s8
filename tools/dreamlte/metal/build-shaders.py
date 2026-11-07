@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile every function of a metallib for the Mali-G71 into one shader cache.
 
-  build-shaders.py METALLIB AIR2NIR OUT.s8sc [--only NAME,...] [-j N]
+  build-shaders.py METALLIB AIR2NIR OUT.s8sc [--only NAME,...] [--spec FILE] [--no-preload] [-j N]
 
 CoreAnimation's shaders (QuartzCore default.metallib) are compiled once on
 the build host with air2nir -D: function constants are read at run time
@@ -14,7 +14,16 @@ names than the 32 VAR slots, so names that never meet in one function share
 a slot (greedy colouring of the "used together" graph).
 
 The cache also holds "@preload", the frame shader the driver uses to reload
-a render target (MTLLoadActionLoad).
+a render target (MTLLoadActionLoad); --no-preload leaves it out (caches
+merged into another, merge-caches.py).
+
+--spec FILE adds specialisations: lines "FUNCTION<TAB>KEY", KEY the exact
+function-constant key the driver logs ("name=0xbits;...", test/fc2spec.py
+collects them). Each is compiled with those constants folded into the generic program
+(air2nir -D -F: the same code the generic shader runs with that key)
+and cached as "FUNCTION@%016x" of the key's FNV-1a hash, which the driver
+looks up before the generic shader (s8_shader_for). Lines for functions
+of other metallibs are ignored.
 
 Output (little endian): "S8SC", u32 version=1, u32 count, count x
 { char name[64], u32 offset, u32 size } (offsets from the file start),
@@ -38,7 +47,9 @@ def varyings_of(bitcode, tmp, name):
 
 
 def colour(sets):
-    names = sorted({n for s in sets for n in s}, key=lambda n: -sum(n in s for s in sets))
+    # ties by name: a set's order varies with Python's string hashing, which
+    # gave every build its own slot numbers
+    names = sorted({n for s in sets for n in s}, key=lambda n: (-sum(n in s for s in sets), n))
     slot = {}
     for n in names:
         used = {slot[m] for s in sets if n in s for m in s if m in slot}
@@ -49,9 +60,28 @@ def colour(sets):
     return slot
 
 
+def key_hash(key):
+    """FNV-1a 64 (s8d_key_hash in s8mtl_draw.h)."""
+    h = 0xcbf29ce484222325
+    for c in key.encode():
+        h = ((h ^ c) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+
+
 def main():
     args = sys.argv[1:]
-    only, jobs = None, os.cpu_count() or 4
+    only, jobs, spec, preload = None, os.cpu_count() or 4, [], True
+    if '--spec' in args:
+        i = args.index('--spec')
+        for line in open(args[i + 1]):
+            line = line.rstrip('\n')
+            if line and not line.startswith('#'):
+                fn, key = line.split('\t', 1)
+                spec.append((fn, key))
+        del args[i:i + 2]
+    if '--no-preload' in args:
+        args.remove('--no-preload')
+        preload = False
     if '--only' in args:
         i = args.index('--only')
         only = set(args[i + 1].split(','))
@@ -67,12 +97,24 @@ def main():
         slots = colour(sets)
         table = ','.join(f'{n}={s}' for n, s in sorted(slots.items(), key=lambda x: x[1]))
         todo = [f for f in funcs if only is None or f['name'] in only]
-        todo.append({'name': '@preload'})       # the driver's render target reload shader
+        if preload:
+            todo.append({'name': '@preload'})   # the driver's render target reload shader
+        have = {f['name'] for f in funcs}
+        for fn, key in spec:
+            if fn in have:
+                todo.append({'name': f'{fn}@{key_hash(key):016x}', 'function': fn, 'key': key})
 
         def build(f):
             o = os.path.join(tmp, f['name'] + '.s8sh')
-            r = subprocess.run([air2nir, lib, f['name'], o, '-D', '-v', table],
-                               capture_output=True, text=True)
+            if 'key' in f:
+                consts = []
+                for kv in f['key'].split(';'):
+                    if '=' in kv:
+                        consts += ['-c', kv]
+                cmd = [air2nir, lib, f['function'], o, '-D', '-F'] + consts + ['-v', table]
+            else:
+                cmd = [air2nir, lib, f['name'], o, '-D', '-v', table]
+            r = subprocess.run(cmd, capture_output=True, text=True)
             msg = [l for l in r.stderr.splitlines() if 'unsupported' in l or 'error' in l.lower()
                    or 'air2nir: fail' in l]
             ok = r.returncode == 0 and os.path.exists(o)
