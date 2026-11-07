@@ -9,6 +9,6 @@ exports:
                        _objc_opt_new, _objc_retain, _objc_release, _objc_autorelease,
                        _objc_retainAutoreleasedReturnValue, _objc_autoreleaseReturnValue,
                        _objc_storeStrong, _class_addMethod, _class_getName, _sel_getName,
-                       _object_getClass, __objc_empty_cache ]
+                       _object_getClass, _objc_getClass, __objc_empty_cache ]
     objc-classes:    [ NSObject ]
 ...

@@ -93,12 +93,20 @@ static void s8_constants_key(id values, char *out, size_t len)
 
 - (instancetype)initWithDevice:(id)device path:(const char *)path
 {
+	size_t len = 0;
+	uint8_t *d = path ? s8_read_file(path, &len) : NULL;
+	self = [self initWithDevice:device bytes:d length:len what:path ? path : "?"];
+	free(d);
+	return self;
+}
+
+/* A metallib in memory (newLibraryWithData:, MetalPerformanceShaders). */
+- (instancetype)initWithDevice:(id)device bytes:(const uint8_t *)d length:(size_t)len what:(const char *)what
+{
 	self = [super init];
 	if (self == nil)
 		return nil;
 	_s8device = device;
-	size_t len = 0;
-	uint8_t *d = path ? s8_read_file(path, &len) : NULL;
 	if (d != NULL && len > 0x58 && s8_u32(d) == 0x424c544d /* "MTLB" */) {
 		uint64_t list = s8_u64(d + 0x18);
 		uint32_t count = list + 4 <= len ? s8_u32(d + list) : 0;
@@ -119,8 +127,7 @@ static void s8_constants_key(id values, char *out, size_t len)
 			off = end;
 		}
 	}
-	free(d);
-	s8_log("MTL library %s: %u functions", path ? path : "?", _nfuncs);
+	s8_log("MTL library %.80s: %u functions", what, _nfuncs);
 	return self;
 }
 

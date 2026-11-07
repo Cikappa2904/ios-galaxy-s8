@@ -21,6 +21,7 @@
 
 size_t strlen(const char *);
 void *memset(void *, int, size_t);
+int snprintf(char *, size_t, const char *, ...);
 
 @implementation S8MaliDevice
 
@@ -146,6 +147,52 @@ S8_FORWARDING
 	return [[S8Library alloc] initWithDevice:self path:[[url path] UTF8String]];
 }
 
+/*
+ * The other ways to get a library. Unimplemented they went to Apple's
+ * _MTLDevice, whose library could not make the functions without Apple's
+ * compiler service: MetalPerformanceShaders in SpringBoard failed with
+ * "MTLComputePipelineStateCache unable to load function" and aborted, so the
+ * lock screen never drew. Kernels get stub compute pipelines (dispatches are
+ * skipped, newComputePipelineStateWithFunction).
+ */
+- (id)newLibraryWithFile:(id)path error:(id *)error
+{
+	if (error != NULL)
+		*error = nil;
+	return [[S8Library alloc] initWithDevice:self path:[path UTF8String]];
+}
+
+- (id)newDefaultLibraryWithBundle:(id)bundle error:(id *)error
+{
+	char p[1024];
+	if (error != NULL)
+		*error = nil;
+	const char *dir = bundle ? [[bundle bundlePath] UTF8String] : NULL;
+	snprintf(p, sizeof(p), "%s/default.metallib", dir ? dir : ".");
+	return [[S8Library alloc] initWithDevice:self path:p];
+}
+
+- (id)newDefaultLibrary
+{
+	return [self newDefaultLibraryWithBundle:[objc_getClass("NSBundle") mainBundle] error:NULL];
+}
+
+void *dispatch_data_create_map(void *data, const void **buffer, size_t *size);
+
+- (id)newLibraryWithData:(id)data error:(id *)error
+{
+	const void *bytes = NULL;
+	size_t len = 0;
+	if (error != NULL)
+		*error = nil;
+	id map = data ? (id)dispatch_data_create_map((void *)data, &bytes, &len) : nil;
+	char what[48];
+	snprintf(what, sizeof(what), "(data, %zu bytes)", len);
+	id lib = [[S8Library alloc] initWithDevice:self bytes:bytes length:len what:what];
+	[map release];
+	return lib;
+}
+
 static id s8_error(const char *what)
 {
 	return [NSError errorWithDomain:[NSString stringWithUTF8String:what] code:1 userInfo:nil];
@@ -245,13 +292,71 @@ static id s8_error(const char *what)
 
 - (id)newComputePipelineStateWithFunction:(id)function error:(id *)error
 {
-	S8Function *f = function;
+	static unsigned logged;
 	if (error != NULL)
 		*error = nil;
-	s8_log("MTL compute pipeline %s (stage 2: dispatches are skipped)", f ? [f->_name UTF8String] : "-");
+	if (logged++ < 40)
+		s8_log("MTL compute pipeline %s %s (stage 2: dispatches are skipped)",
+		    function ? class_getName(object_getClass(function)) : "-",
+		    function ? [[function name] UTF8String] : "-");
 	S8ComputePipelineState *p = [[S8ComputePipelineState alloc] init];
 	p->_s8device = self;
 	return p;
+}
+
+/* The other compute pipeline requests (MetalPerformanceShaders), all to the
+ * same stub; reflection is not provided. */
+- (id)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options
+    reflection:(id *)reflection error:(id *)error
+{
+	(void)options;
+	if (reflection != NULL)
+		*reflection = nil;
+	return [self newComputePipelineStateWithFunction:function error:error];
+}
+
+- (id)newComputePipelineStateWithDescriptor:(id)desc options:(NSUInteger)options
+    reflection:(id *)reflection error:(id *)error
+{
+	(void)options;
+	if (reflection != NULL)
+		*reflection = nil;
+	return [self newComputePipelineStateWithFunction:[desc computeFunction] error:error];
+}
+
+/* Blocks (Apple ABI): isa, flags, reserved, invoke(block, ...) */
+struct s8_handler_block {
+	void *isa;
+	int flags, reserved;
+	void (*invoke)(void *block, ...);
+};
+
+- (void)newComputePipelineStateWithFunction:(id)function completionHandler:(id)handler
+{
+	id p = [self newComputePipelineStateWithFunction:function error:NULL];
+	if (handler != nil)
+		((struct s8_handler_block *)handler)->invoke(handler, p, nil);
+	[p release];
+}
+
+- (void)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options
+    completionHandler:(id)handler
+{
+	(void)options;
+	id p = [self newComputePipelineStateWithFunction:function error:NULL];
+	if (handler != nil)
+		((struct s8_handler_block *)handler)->invoke(handler, p, nil, nil);
+	[p release];
+}
+
+- (void)newComputePipelineStateWithDescriptor:(id)desc options:(NSUInteger)options
+    completionHandler:(id)handler
+{
+	(void)options;
+	id p = [self newComputePipelineStateWithFunction:[desc computeFunction] error:NULL];
+	if (handler != nil)
+		((struct s8_handler_block *)handler)->invoke(handler, p, nil, nil);
+	[p release];
 }
 
 - (id)newRenderPipelineStateWithTileDescriptor:(id)desc options:(NSUInteger)options

@@ -18,6 +18,7 @@ typedef id (*IMP)(id, SEL, ...);
 const char *sel_getName(SEL sel);
 const char *class_getName(Class cls);
 Class object_getClass(id obj);
+id objc_getClass(const char *name);
 BOOL class_addMethod(Class cls, SEL name, IMP imp, const char *types);
 
 __attribute__((objc_root_class))
