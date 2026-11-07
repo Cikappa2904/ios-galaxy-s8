@@ -1565,13 +1565,17 @@ static unsigned s8_lower16(const nir_instr *instr, void *data)
 	if (instr->type != nir_instr_type_alu)
 		return 0;
 	const nir_alu_instr *alu = nir_instr_as_alu(instr);
-	/* conversions keep their sizes (they are the 16/32-bit boundary) */
+	/* conversions keep their sizes (they are the 8/16/32-bit boundary) */
 	if (nir_op_infos[alu->op].is_conversion || nir_op_is_vec_or_mov(alu->op))
 		return 0;
-	if (alu->def.bit_size == 16)
+	/* 8-bit ALU too: Mesa vectorises it to v4i8 Bifrost instructions, and
+	 * on the G71 a QuartzCore fragment shader faulted INSTR_INVALID_ENC
+	 * inside its first 501 quadwords, where the only instruction the probe
+	 * run had not proven is ICMP.v4i8.m1.ne (bool function constants). */
+	if (alu->def.bit_size == 16 || alu->def.bit_size == 8)
 		return 32;
 	for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
-		if (nir_src_bit_size(alu->src[i].src) == 16)
+		if (nir_src_bit_size(alu->src[i].src) == 16 || nir_src_bit_size(alu->src[i].src) == 8)
 			return 32;
 	return 0;
 }
