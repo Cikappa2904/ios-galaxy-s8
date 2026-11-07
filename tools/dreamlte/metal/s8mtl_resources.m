@@ -280,6 +280,14 @@ static void s8_copy_rows(uint8_t *dst, NSUInteger dstPitch, const uint8_t *src, 
 	v->_rowBytes = _rowBytes;
 	v->_cpu = _cpu;
 	v->_gpu = _gpu;
+	/* A view of an IOSurface texture is GPU-visible through the surface
+	 * (s8_texture_ref maps it at bind time); without it the view had no
+	 * GPU address and bound as the null texture (transparent black). */
+	if (_iosurface != NULL) {
+		v->_iosurface = _iosurface;
+		CFRetain(_iosurface);
+		v->_plane = _plane;
+	}
 	v->_parent = [self retain];
 	return v;
 }

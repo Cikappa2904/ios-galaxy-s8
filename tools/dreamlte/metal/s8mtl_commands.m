@@ -305,12 +305,46 @@ static void s8_shot(S8Texture *t)
 
 /* ---- render encoder ---- */
 
+uint32_t IOSurfaceGetID(void *surface);
+
+/*
+ * What the fragment shaders sample (boot idx1: every image layer composited
+ * black): the first 300 fragment bindings and every failed one (up to
+ * 100), with the texture's class, size, format, GPU address, IOSurface,
+ * parent (views) and the first and centre texels as the CPU sees them.
+ */
+static void s8_log_binding(unsigned stage, NSUInteger index, id t, int ok, const struct s8d_texture *ref)
+{
+	static unsigned logged, failed;
+	if (stage != S8D_STAGE_FRAGMENT || t == nil)
+		return;
+	if (ok ? logged++ >= 300 : failed++ >= 100)
+		return;
+	if (![t isKindOfClass:[S8Texture class]]) {
+		s8_log("MTL bind fs[%lu]: foreign %s", (unsigned long)index, class_getName(object_getClass(t)));
+		return;
+	}
+	S8Texture *x = t;
+	uint32_t first = 0, centre = 0;
+	unsigned bpp = s8_format_bpp(x->_format);
+	if (x->_cpu != NULL && bpp == 4 && x->_rowBytes) {
+		memcpy(&first, x->_cpu, 4);
+		memcpy(&centre, x->_cpu + (x->_height / 2) * x->_rowBytes + (x->_width / 2) * 4, 4);
+	}
+	s8_log("MTL bind fs[%lu]%s: %lux%lu fmt %lu gpu 0x%llx surf %u%s cpu %s px %08x/%08x", (unsigned long)index,
+	    ok ? "" : " NULL", (unsigned long)x->_width, (unsigned long)x->_height, (unsigned long)x->_format,
+	    (unsigned long long)(ok ? ref->gpu : x->_gpu), x->_iosurface ? IOSurfaceGetID(x->_iosurface) : 0,
+	    x->_parent != nil ? " view" : "", x->_cpu ? "yes" : "no", first, centre);
+}
+
 static void s8_bind_texture(struct s8d_cmdbuf *d, unsigned stage, NSUInteger index, id t)
 {
 	struct s8d_texture ref;
 	if (d == NULL)
 		return;
-	if (t != nil && s8_texture_ref(t, &ref) == 0)
+	int ok = t != nil && s8_texture_ref(t, &ref) == 0;
+	s8_log_binding(stage, index, t, ok, &ref);
+	if (ok)
 		s8d_set_texture(d, stage, (unsigned)index, &ref);
 	else
 		s8d_set_texture(d, stage, (unsigned)index, NULL);
