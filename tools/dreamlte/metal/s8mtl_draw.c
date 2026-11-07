@@ -621,6 +621,27 @@ static bool s8_rt_formats(enum pipe_format pf, uint32_t *writeback, uint32_t *in
 	return true;
 }
 
+/*
+ * Blend descriptors follow the renderer state, one per render target the
+ * shader's BLEND instructions name. Passes have one colour attachment, but
+ * a shader may still blend to more: QuartzCore's fixed_frag_lph_cpf has
+ * BLEND for RT 0, 1 and 2, on paths its function constants select. Their
+ * descriptors were left zero, and mode 0 is "blend shader" at PC 0: the
+ * G71 jumped there and faulted INSTR_INVALID_ENC. As Panfrost does for
+ * render targets without a format, RT 1..7 are disabled with mode Off.
+ */
+#define S8_BLEND_RTS 8
+
+static void s8_blend_off_rts(struct mali_blend_packed *rt0)
+{
+	for (unsigned rt = 1; rt < S8_BLEND_RTS; rt++) {
+		pan_pack(&rt0[rt], BLEND, cfg) {
+			cfg.enable = false;
+			cfg.internal.mode = MALI_BLEND_MODE_OFF;
+		}
+	}
+}
+
 /* Upper word of the internal blend descriptor the fragment shader's
  * framebuffer fetch converts with (pan_blend_get_internal_desc). */
 static uint32_t s8_rt_conversion(enum pipe_format pf, unsigned size)
@@ -1587,8 +1608,10 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 	}
 	memset(&vbd[S8_VARY_COUNT], 0, pan_size(ATTRIBUTE_BUFFER));
 
-	/* Fragment renderer state + blend (blend constant per draw). */
-	struct s8_ptr rsd = s8_alloc(&cb->arena, pan_size(RENDERER_STATE) + pan_size(BLEND), pan_alignment(RENDERER_STATE));
+	/* Fragment renderer state + blend (blend constant per draw), then the
+	 * other render targets' blend descriptors Off: see s8_blend_off_rts. */
+	struct s8_ptr rsd = s8_alloc(&cb->arena, pan_size(RENDERER_STATE) + S8_BLEND_RTS * pan_size(BLEND),
+	    pan_alignment(RENDERER_STATE));
 	if (!rsd.cpu) {
 		p->skipped++;
 		return;
@@ -1596,6 +1619,7 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 	memcpy(rsd.cpu, &pl->fs_rsd, pan_size(RENDERER_STATE));
 	struct mali_blend_packed *bl = (void *)((uint8_t *)rsd.cpu + pan_size(RENDERER_STATE));
 	memcpy(bl, &pl->blend, pan_size(BLEND));
+	s8_blend_off_rts(bl);
 	if (pl->blend_uses_constant) {
 		float c = pl->constant_mask ? cb->blend_color[ffs(pl->constant_mask) - 1] : 0;
 		/* pack_blend_constant: unorm of the channel size, left aligned in 16 bits */
@@ -1841,7 +1865,8 @@ static int s8_preload(struct s8d_cmdbuf *cb, struct s8_pass *p)
 	if (sh == NULL)
 		return -1;
 	struct s8_ptr dcds = s8_alloc_descs(&cb->arena, 3, DRAW);
-	struct s8_ptr rsd = s8_alloc(&cb->arena, pan_size(RENDERER_STATE) + pan_size(BLEND), pan_alignment(RENDERER_STATE));
+	struct s8_ptr rsd = s8_alloc(&cb->arena, pan_size(RENDERER_STATE) + S8_BLEND_RTS * pan_size(BLEND),
+	    pan_alignment(RENDERER_STATE));
 	struct s8_ptr tex = s8_alloc_desc(&cb->arena, TEXTURE);
 	struct s8_ptr surf = s8_alloc_desc(&cb->arena, SURFACE_WITH_STRIDE);
 	struct s8_ptr smp = s8_alloc_desc(&cb->arena, SAMPLER);
@@ -1885,6 +1910,7 @@ static int s8_preload(struct s8d_cmdbuf *cb, struct s8_pass *p)
 		cfg.internal.fixed_function.conversion.register_format = MALI_REGISTER_FILE_FORMAT_F32;
 		cfg.internal.fixed_function.rt = 0;
 	}
+	s8_blend_off_rts((struct mali_blend_packed *)((uint8_t *)rsd.cpu + pan_size(RENDERER_STATE)));
 	s8_pack_texture(tex.cpu, surf.cpu, surf.gpu, &p->target);
 	struct s8d_sampler nearest = { .normalized = 0 };
 	s8_pack_sampler(smp.cpu, &nearest);
