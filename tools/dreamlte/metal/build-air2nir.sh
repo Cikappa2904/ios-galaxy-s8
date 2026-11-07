@@ -5,6 +5,14 @@
 set -euo pipefail
 src=$(realpath "$1"); bld=$(realpath "$2"); out=$(realpath -m "$3")
 here=$(dirname "$(realpath "$0")")
+# Our fixes to Mesa's compiler (mesa-patches/), applied once to MESA_SRC.
+for p in "$here"/mesa-patches/*.patch; do
+	if patch -d "$src" -p1 -R -s -f --dry-run < "$p" >/dev/null 2>&1; then
+		continue                                        # already applied
+	fi
+	patch -d "$src" -p1 -s -N < "$p" || { echo "cannot apply $p" >&2; exit 1; }
+	echo "applied $(basename "$p")"
+done
 ninja -C "$bld" src/panfrost/lib/libpanfrost_lib.a src/panfrost/lib/libpan-arch-v6.a \
 	src/panfrost/compiler/libpanfrost_bifrost.a src/compiler/nir/libnir.a src/util/libmesa_util.a >/dev/null
 # Mesa's own flags for its v6 objects (defines, HAVE_* probes, includes).

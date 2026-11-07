@@ -1,0 +1,29 @@
+pan/bi: lower 16-bit swizzles of 8-bit sources with SWZ.v2i16
+
+bi_lower_swizzle picked SWZ.v4i8 for any source of an 8-bit instruction,
+also when the swizzle is one of the four 16-bit ones (H00/H01/H10/H11,
+which alias B0101/B0123/B2301/B2323). SWZ.v4i8 only encodes B0000..B3210
+(values 4..11): an H11 on a MUX.v4i8 source became a SWZ.v4i8 whose packed
+bits Mesa's own disassembler reads as "FCMP.f32.total.reserved", and the
+Mali-G71 faults the shader with INSTR_INVALID_ENC (QuartzCore's
+fixed_frag_lph_cpf, Galaxy S8). A 16-bit swizzle moves the same bytes
+whatever the consumer's lane size, so take SWZ.v2i16 for those and
+SWZ.v4i8 for the byte swizzles (also for 16-bit consumers, which got a
+SWZ.v2i16 with an 8-bit swizzle before).
+
+--- a/src/panfrost/compiler/bi_lower_swizzle.c
++++ b/src/panfrost/compiler/bi_lower_swizzle.c
+@@ -172,9 +172,10 @@
+    /* Lower it away */
+    bi_builder b = bi_init_builder(ctx, bi_before_instr(ins));
+
+-   bool is_8 = (bi_get_opcode_props(ins)->size == BI_SIZE_8) ||
+-               (bi_get_opcode_props(ins)->size == BI_SIZE_32 &&
+-                ins->src[src].swizzle >= BI_SWIZZLE_B0000);
++   /* By the swizzle, not the instruction: SWZ.v4i8 only encodes the byte
++    * swizzles (B0000..B3210), SWZ.v2i16 the 16-bit ones (H00..H11, which
++    * alias B0101/B0123/B2301/B2323 and so also serve 8-bit consumers). */
++   bool is_8 = ins->src[src].swizzle >= BI_SWIZZLE_B0000;
+
+    bi_index orig = ins->src[src];
+    bi_index stripped = bi_replace_index(bi_null(), orig);
