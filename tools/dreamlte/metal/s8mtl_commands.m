@@ -276,6 +276,20 @@ static void s8_shot(S8Texture *t)
 			if (p->gpu >= 0 && s8d_pass_execute(_draw, p->gpu) == 0) {
 				gpu++;
 				s8_shot(p->target);
+				/* where the colours go (boot tex1: the display only blue):
+				 * two raw texels of each of the first 80 full-screen
+				 * passes, centre and lower left */
+				S8Texture *tg = p->target;
+				static unsigned probed;
+				if (tg != nil && tg->_cpu != NULL && tg->_rowBytes && tg->_width >= 1000 &&
+				    s8_format_bpp(tg->_format) == 4 && probed++ < 80) {
+					uint32_t a, b;
+					memcpy(&a, tg->_cpu + (tg->_height / 2) * tg->_rowBytes + (tg->_width / 2) * 4, 4);
+					memcpy(&b, tg->_cpu + (tg->_height * 9 / 10) * tg->_rowBytes + (tg->_width / 8) * 4, 4);
+					s8_log("MTL probe %lux%lu fmt %lu load %lu draws %u: %08x %08x", (unsigned long)tg->_width,
+					    (unsigned long)tg->_height, (unsigned long)tg->_format, (unsigned long)p->load,
+					    p->draws, a, b);
+				}
 			} else if (p->load == MTLLoadActionClear) {
 				s8_cpu_clear(p->target, p->clear);
 				clears++;

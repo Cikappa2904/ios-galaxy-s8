@@ -14,6 +14,8 @@ void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 void *IOSurfaceGetBaseAddressOfPlane(void *surface, size_t plane);
 size_t IOSurfaceGetBytesPerRowOfPlane(void *surface, size_t plane);
+void *IOSurfaceGetBaseAddress(void *surface);
+size_t IOSurfaceGetBytesPerRow(void *surface);
 size_t IOSurfaceGetAllocSize(void *surface);
 uint32_t IOSurfaceGetID(void *surface);
 const void *CFRetain(const void *);
@@ -156,6 +158,15 @@ static void s8_texture_from_descriptor(S8Texture *t, id device, id desc)
 		CFRetain(surface);
 		_cpu = IOSurfaceGetBaseAddressOfPlane(surface, plane);
 		_rowBytes = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+		/* CoreAnimation's display surfaces ('b3a8', two planes) report
+		 * no plane geometry (bytes per row 0) and a plane-0 address
+		 * where the CPU found only zeros (boot tex1), while the GPU
+		 * (S8MALI_MAP_SURFACE offset 0) and the kernel's present use
+		 * the surface's start: plane 0 is the surface's base. */
+		if (plane == 0 && _rowBytes == 0) {
+			_cpu = IOSurfaceGetBaseAddress(surface);
+			_rowBytes = IOSurfaceGetBytesPerRow(surface);
+		}
 	}
 	if (logged++ < 24)
 		s8_log("MTL IOSurface %u texture %lux%lu fmt %lu plane %lu bpr %lu usage 0x%lx",
@@ -171,6 +182,8 @@ static void s8_texture_from_descriptor(S8Texture *t, id device, id desc)
 		[_parent release];
 	else
 		s8_mem_free(&_mem);
+	if (_shadow.gpu != 0)
+		s8_mem_free(&_shadow);
 	if (_iosurface != NULL)
 		CFRelease(_iosurface);
 	[super dealloc];
@@ -403,6 +416,39 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 			s8_log("MTL IOSurface %u plane %lu: plane offsets not handled", m.id, (unsigned long)t->_plane);
 		if (m.bytes_per_row)
 			out->row_bytes = m.bytes_per_row;
+	}
+	/*
+	 * Linear textures over -newBufferWithBytesNoCopy: buffers live in the
+	 * caller's memory, which the GPU cannot see (CoreAnimation's glyph and
+	 * icon images: boot tex1 bound them as the null texture). The texels
+	 * are copied into GPU memory owned by the texture at every bind.
+	 */
+	if (out->gpu == 0 && t->_iosurface == NULL && t->_cpu != NULL && t->_rowBytes != 0 && t->_height != 0) {
+		NSUInteger size = t->_rowBytes * t->_height * (t->_depth ? t->_depth : 1);
+		/* never past the end of the backing buffer */
+		if (t->_parent != nil && [t->_parent isKindOfClass:[S8Buffer class]]) {
+			S8Buffer *b = t->_parent;
+			NSUInteger off = (NSUInteger)(t->_cpu - (uint8_t *)b->_mem.cpu);
+			if (b->_mem.cpu == NULL || off > b->_length)
+				size = 0;
+			else if (size > b->_length - off)
+				size = b->_length - off;
+		}
+		if (size == 0)
+			return -1;
+		if (t->_shadow.gpu != 0 && t->_shadowSize < size) {
+			s8_mem_free(&t->_shadow);
+			t->_shadowSize = 0;
+		}
+		if (t->_shadow.gpu == 0 && s8_mem_alloc(&t->_shadow, size, 256) == 0)
+			t->_shadowSize = size;
+		if (t->_shadow.gpu != 0) {
+			memcpy(t->_shadow.cpu, t->_cpu, size);
+			out->gpu = t->_shadow.gpu;
+		} else if (logged++ < 10) {
+			s8_log("MTL texture %lux%lu fmt %lu: no GPU memory for its copy", (unsigned long)t->_width,
+			    (unsigned long)t->_height, (unsigned long)t->_format);
+		}
 	}
 	return out->gpu ? 0 : -1;
 }

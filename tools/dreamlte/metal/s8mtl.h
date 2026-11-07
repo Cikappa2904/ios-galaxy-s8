@@ -121,6 +121,8 @@ id s8_forward(id self, SEL sel);
 	void *_iosurface;       /* IOSurfaceRef, retained */
 	NSUInteger _plane;
 	id _parent;             /* texture views share their parent's memory */
+	s8_mem _shadow;         /* GPU copy of texels the GPU cannot see (NoCopy buffers) */
+	NSUInteger _shadowSize;
 }
 - (instancetype)initWithDevice:(id)device descriptor:(id)desc;
 - (instancetype)initWithDevice:(id)device descriptor:(id)desc iosurface:(void *)surface plane:(NSUInteger)plane;
