@@ -961,8 +961,13 @@ struct s8d_pipeline *s8d_pipeline_new(const struct s8d_pipeline_desc *d, unsigne
 			cfg.internal.fixed_function.alpha_zero_nop = pan_blend_alpha_zero_nop(eq);
 			cfg.internal.fixed_function.alpha_one_store = pan_blend_alpha_one_store(eq);
 		}
+		/* The shader's own register format for RT 0. MALI_REGISTER_FILE_
+		 * FORMAT_F16 is 0: taking 0 for "not set" turned every half-float
+		 * output (all of CoreAnimation's shaders) into F32, so BLEND read
+		 * pairs of halves as one float (the GPU self-test of boot
+		 * selftest1: 0x3C003A00 = 1.0|0.75 came out as 0.0078). */
 		cfg.internal.fixed_function.conversion.register_format =
-		    p->fs && p->fs->rt_regfmt[0] ? p->fs->rt_regfmt[0] : MALI_REGISTER_FILE_FORMAT_F32;
+		    p->fs ? p->fs->rt_regfmt[0] : MALI_REGISTER_FILE_FORMAT_F32;
 	}
 	if (p->color != PIPE_FORMAT_NONE) {
 		p->rt_conv[0] = s8_rt_conversion(p->color, 32);
