@@ -93,6 +93,8 @@ enum { MTLCommandBufferStatusCompleted = 4 };
 - (id)localizedDescription;
 - (id)newNamedConstantArray;
 - (id)newIndexedConstantArray;
++ (id)errorWithDomain:(id)domain code:(NSInteger)code userInfo:(id)info;
++ (id)stringWithUTF8String:(const char *)s;
 - (NSUInteger)index;
 - (id)objectAtIndex:(NSUInteger)i;
 - (NSUInteger)dataType;

@@ -227,11 +227,14 @@ struct s8_pass {
 - (instancetype)initWithS8CommandBuffer:(S8CommandBuffer *)cb;
 @end
 
-@interface S8ComputeEncoder : _MTLCommandEncoder <MTLComputeCommandEncoder>
+@interface S8ComputeEncoder : _MTLCommandEncoder <MTLComputeCommandEncoder> {
+	id _pipeline;           /* S8ComputePipelineState, not retained (dispatch log) */
+}
 @end
 
 @interface S8ComputePipelineState : NSObject <MTLComputePipelineState> {
 @public
 	id _s8device;
+	char _name[48];         /* the kernel's function name */
 }
 @end

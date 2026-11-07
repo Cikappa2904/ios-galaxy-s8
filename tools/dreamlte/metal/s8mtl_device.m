@@ -22,6 +22,23 @@
 size_t strlen(const char *);
 void *memset(void *, int, size_t);
 int snprintf(char *, size_t, const char *, ...);
+int strncmp(const char *, const char *, size_t);
+char *strstr(const char *, const char *);
+int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+const char *getprogname(void);
+
+/* 0 with boot-arg s8vtcompute=0: VideoToolbox's GPU paths are refused
+ * (newComputePipelineStateWithFunction:error:, render pipelines below). */
+static int s8_vt_gpu(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		char args[1024] = "";
+		size_t alen = sizeof(args) - 1;
+		on = !(sysctlbyname("kern.bootargs", args, &alen, NULL, 0) == 0 && strstr(args, "s8vtcompute=0") != NULL);
+	}
+	return on;
+}
 
 @implementation S8MaliDevice
 
@@ -305,6 +322,18 @@ static id s8_error(const char *what)
 		}
 	}
 	p->_gpu = s8d_pipeline_new(&d, p->_id);
+	/* s8vtcompute=0: VideoToolbox's render path cannot run either (its
+	 * fragment shaders need local arrays air2nir does not translate yet),
+	 * so refuse it too and leave VideoToolbox the CPU. */
+	if (p->_gpu == NULL && !s8_vt_gpu() && fs != nil && strncmp([fs->_name UTF8String], "VTMTS", 5) == 0) {
+		s8_log("MTL pipeline %u: VideoToolbox render pipeline refused (s8vtcompute=0) [%s]", p->_id,
+		    getprogname());
+		[p release];
+		if (error != NULL)
+			*error = [objc_getClass("NSError") errorWithDomain:[objc_getClass("NSString")
+			    stringWithUTF8String:"S8MaliMetal"] code:2 userInfo:nil];
+		return nil;
+	}
 	return p;
 }
 
@@ -313,12 +342,30 @@ static id s8_error(const char *what)
 	static unsigned logged;
 	if (error != NULL)
 		*error = nil;
+	const char *name = function ? [[function name] UTF8String] : NULL;
+	if (name == NULL)
+		name = "-";
+	/*
+	 * Compute kernels do not run yet (dispatches are skipped), so whatever
+	 * a kernel should write stays zero. VideoToolbox's pixel transfers
+	 * (VTMTSCompute*) made SpringBoard's wallpaper image that way: black
+	 * (boot f16). Boot-arg s8vtcompute=0 refuses those pipelines with an
+	 * error, so VideoToolbox can take its render-pipeline path
+	 * (VTMTSVertexFunction/VTMTSFragmentFunction, in the shader cache) or
+	 * the CPU instead.
+	 */
+	if (!s8_vt_gpu() && strncmp(name, "VTMTSCompute", 12) == 0) {
+		s8_log("MTL compute pipeline %.40s refused (s8vtcompute=0) [%s]", name, getprogname());
+		if (error != NULL)
+			*error = [objc_getClass("NSError") errorWithDomain:[objc_getClass("NSString")
+			    stringWithUTF8String:"S8MaliMetal"] code:1 userInfo:nil];
+		return nil;
+	}
 	if (logged++ < 40)
-		s8_log("MTL compute pipeline %s %s (stage 2: dispatches are skipped)",
-		    function ? class_getName(object_getClass(function)) : "-",
-		    function ? [[function name] UTF8String] : "-");
+		s8_log("MTL compute pipeline %.40s (dispatches skipped) [%s]", name, getprogname());
 	S8ComputePipelineState *p = [[S8ComputePipelineState alloc] init];
 	p->_s8device = self;
+	snprintf(p->_name, sizeof(p->_name), "%s", name);
 	return p;
 }
 

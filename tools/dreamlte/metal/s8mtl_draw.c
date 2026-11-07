@@ -238,6 +238,8 @@ static struct {
 	unsigned core_id_range, threads_per_core;
 	uint32_t tiler_features;
 	bool no_spec;                   /* boot-arg s8spec=0: generic shaders only */
+	bool raw_rt_ok;                 /* RAW render targets (RGBA16F) proven by the self-test */
+	bool selftesting;
 } s8g = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static uint32_t rd32(const uint8_t *p)
@@ -643,13 +645,36 @@ static enum pipe_blend_func s8_blend_op(unsigned op)
 
 /* Render target writeback/internal formats and swizzle (pan_desc.c
  * get_rt_formats). */
+/* Formats the blend unit cannot blend (RGBA16F: CoreAnimation's blur and
+ * material targets) are stored RAW, written through the OPAQUE conversion
+ * (as pan_blend_get_internal_desc does for blend shaders); used only once
+ * the self-test proved it on the GPU (s8g.raw_rt_ok). */
+static bool s8_rt_is_raw(enum pipe_format pf)
+{
+	const struct pan_blendable_format *bf = GENX(pan_blendable_format_from_pipe_format)(pf);
+	return bf == NULL || !bf->internal;
+}
+
 static bool s8_rt_formats(enum pipe_format pf, uint32_t *writeback, uint32_t *internal, uint32_t *swizzle)
 {
 	const struct util_format_description *desc = util_format_description(pf);
 	const struct pan_blendable_format *bf = GENX(pan_blendable_format_from_pipe_format)(pf);
-	if (desc == NULL || bf == NULL || !bf->internal)
+	if (desc == NULL)
 		return false;
 	unsigned char sw[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+	if (bf == NULL || !bf->internal) {
+		/* get_rt_formats' RAW case */
+		unsigned bits = desc->block.bits;
+		switch (bits) {
+		case 32: *writeback = MALI_COLOR_FORMAT_RAW32; break;
+		case 64: *writeback = MALI_COLOR_FORMAT_RAW64; break;
+		case 128: *writeback = MALI_COLOR_FORMAT_RAW128; break;
+		default: return false;
+		}
+		*internal = MALI_COLOR_BUFFER_INTERNAL_FORMAT_RAW8 + util_logbase2_ceil(bits) - 3;
+		*swizzle = pan_translate_swizzle_4(sw);
+		return true;
+	}
 	*internal = bf->internal;
 	*writeback = bf->writeback;
 	pan_invert_swizzle(desc->swizzle, sw);
@@ -921,6 +946,16 @@ struct s8d_pipeline *s8d_pipeline_new(const struct s8d_pipeline_desc *d, unsigne
 		goto fail;
 	}
 	bool opaque = pan_blend_is_opaque(eq) && eq.color_mask == 0xf;
+	/* RAW targets (RGBA16F) can only be written OPAQUE: blending and
+	 * colour masks would need a blend shader (logged, then ignored) */
+	if (p->color != PIPE_FORMAT_NONE && s8_rt_is_raw(p->color)) {
+		static unsigned raw_logged;
+		if (!opaque && raw_logged++ < 10)
+			s8_log("MTL pipeline %u: blending/mask on a RAW target (format %d) written opaque", id, p->color);
+		eq.blend_enable = false;
+		eq.color_mask = 0xf;
+		opaque = true;
+	}
 	p->constant_mask = pan_blend_constant_mask(eq);
 	p->blend_uses_constant = p->constant_mask != 0;
 	if (p->fs != NULL) {
@@ -1105,6 +1140,7 @@ int s8d_pass_begin(struct s8d_cmdbuf *cb, const struct s8d_texture *target, unsi
 	enum pipe_format pf = target ? s8_pixel_format(target->format) : PIPE_FORMAT_NONE;
 	uint32_t wb, internal, sw;
 	if (target == NULL || target->gpu == 0 || pf == PIPE_FORMAT_NONE || !s8_rt_formats(pf, &wb, &internal, &sw) ||
+	    (s8_rt_is_raw(pf) && !s8g.raw_rt_ok && !s8g.selftesting) ||
 	    target->width == 0 || target->height == 0 || target->width > 4096 || target->height > 4096) {
 		if (logged++ < 20)
 			s8_log("MTL pass skipped: target %ux%u fmt %u gpu 0x%llx", target ? target->width : 0,

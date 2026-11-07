@@ -50,7 +50,7 @@ metal)
 	export S8_DRAM_MIB=${S8_DRAM_MIB:-1024}
 	: "${S8_OVERLAY:?S8_OVERLAY must name the Metal overlay (stage3.ovl)}"
 	args=(cpus=8 s8mngs=0 s8cpufreq=1690000 s8cpufreq_big=2314000 "s8noexec=$noexec"
-		s8gpu=1 sweetfb_gpu=1 s8metal=1 sweetfb_hz=30)
+		s8gpu=1 sweetfb_gpu=1 s8metal=1 sweetfb_hz=30 ${S8_EXTRA_ARGS:-})   # S8_EXTRA_ARGS: more boot-args, e.g. s8vtcompute=0
 	;;
 replay)
 	# gpu with the loader's replay (s8gpu=2) of the job chains in

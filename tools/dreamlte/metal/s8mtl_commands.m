@@ -610,12 +610,37 @@ S8_FORWARDING
 
 /* ---- compute encoder (stage 2: dispatches skipped) ---- */
 
+const char *getprogname(void);
+
+/* Which kernels would run and on what (the skipped work is what stays
+ * black or stale on screen): the first 40 dispatches, with the textures
+ * bound since the last one. */
+static unsigned s8_dispatches;
+
+static void s8_log_dispatch(id pipeline, const char *how, MTLSize g, MTLSize t)
+{
+	if (s8_dispatches++ >= 40)
+		return;
+	S8ComputePipelineState *p = pipeline;
+	s8_log("MTL dispatch %.40s %s %lux%lux%lu x %lux%lux%lu [%s]", p ? p->_name : "-", how,
+	    (unsigned long)g.width, (unsigned long)g.height, (unsigned long)g.depth, (unsigned long)t.width,
+	    (unsigned long)t.height, (unsigned long)t.depth, getprogname());
+}
+
 @implementation S8ComputeEncoder
 S8_FORWARDING
-- (void)setComputePipelineState:(id)s { (void)s; }
+- (void)setComputePipelineState:(id)s { _pipeline = s; }
 - (void)setBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { (void)b; (void)o; (void)i; }
-- (void)setTexture:(id)t atIndex:(NSUInteger)i { (void)t; (void)i; }
+- (void)setTexture:(id)t atIndex:(NSUInteger)i
+{
+	if (s8_dispatches < 40 && t != nil && [t isKindOfClass:[S8Texture class]]) {
+		S8Texture *x = t;
+		s8_log("MTL compute texture %lu: %lux%lu fmt %lu surf %u usage 0x%lx", (unsigned long)i,
+		    (unsigned long)x->_width, (unsigned long)x->_height, (unsigned long)x->_format,
+		    x->_iosurface ? IOSurfaceGetID(x->_iosurface) : 0, (unsigned long)x->_usage);
+	}
+}
 - (void)setThreadgroupMemoryLength:(NSUInteger)l atIndex:(NSUInteger)i { (void)l; (void)i; }
-- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { (void)g; (void)t; }
-- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { (void)g; (void)t; }
+- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { s8_log_dispatch(_pipeline, "groups", g, t); }
+- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { s8_log_dispatch(_pipeline, "threads", g, t); }
 @end

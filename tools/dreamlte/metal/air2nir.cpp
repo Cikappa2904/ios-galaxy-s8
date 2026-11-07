@@ -37,6 +37,7 @@
  *    render target conversions at 32 + (rt * 2 + is16) * 4, the draw's
  *    first vertex at 96, texture sizes at 128 + index * 8.
  */
+#include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/Constants.h>
@@ -434,8 +435,79 @@ static void fold_dynamic(Module &m)
 	dynamic_constants.clear();      /* nothing left to read at run time */
 }
 
+/*
+ * Texture binding indices given by function-constant expressions
+ * ([[texture(expr)]]: the argument's air.location_index operand is a global
+ * that the static initialiser computes; VideoToolbox's shaders). Every use
+ * of such an argument becomes s8.texidx(load global): textures are their
+ * binding index for the translator, so the index is a constant once the
+ * constants are folded and a run-time (texture_offset) index in -D shaders.
+ * Done before anything else, while the arguments' metadata still names the
+ * globals.
+ */
+static void lower_expr_locations(Module &m, Function &entry)
+{
+	LLVMContext &ctx = m.getContext();
+	std::vector<std::pair<unsigned, GlobalVariable *>> found;
+	for (const char *kind : { "air.vertex", "air.fragment", "air.kernel" }) {
+		NamedMDNode *nm = m.getNamedMetadata(kind);
+		if (!nm)
+			continue;
+		for (MDNode *n : nm->operands()) {
+			if (n->getNumOperands() == 0 || mdconst::dyn_extract_or_null<Function>(n->getOperand(0)) != &entry)
+				continue;
+			for (const MDOperand &lop : n->operands()) {
+				auto *list = dyn_cast_or_null<MDNode>(lop.get());
+				if (!list)
+					continue;
+				for (const MDOperand &aop : list->operands()) {
+					auto *a = dyn_cast_or_null<MDNode>(aop.get());
+					if (!a || a->getNumOperands() < 2)
+						continue;
+					auto *argno = mdconst::dyn_extract_or_null<ConstantInt>(a->getOperand(0));
+					if (!argno)
+						continue;
+					bool texture = false;
+					GlobalVariable *gv = nullptr;
+					for (unsigned i = 1; i + 1 < a->getNumOperands(); i++) {
+						auto *s = dyn_cast_or_null<MDString>(a->getOperand(i).get());
+						if (s && s->getString() == "air.texture")
+							texture = true;
+						if (s && s->getString() == "air.location_index")
+							gv = mdconst::dyn_extract_or_null<GlobalVariable>(a->getOperand(i + 1));
+					}
+					if (gv && texture)
+						found.push_back({ (unsigned)argno->getZExtValue(), gv });
+					else if (gv)
+						fail("binding index by function-constant expression for a non-texture argument");
+				}
+			}
+		}
+	}
+	for (auto &[argno, gv] : found) {
+		if (argno >= entry.arg_size())
+			fail("argument index out of range in metadata");
+		Argument *arg = entry.getArg(argno);
+		FunctionCallee fc = m.getOrInsertFunction("s8.texidx", arg->getType(), Type::getInt32Ty(ctx));
+		std::vector<Use *> uses;
+		for (Use &u : arg->uses())
+			uses.push_back(&u);
+		for (Use *u : uses) {
+			auto *ins = cast<Instruction>(u->getUser());
+			/* before the use (in a phi's incoming block: before its end) */
+			Instruction *at = ins;
+			if (auto *phi = dyn_cast<PHINode>(ins))
+				at = phi->getIncomingBlock(*u)->getTerminator();
+			IRBuilder<> b(at);
+			Value *loc = b.CreateLoad(Type::getInt32Ty(ctx), gv);
+			u->set(b.CreateCall(fc, { loc }));
+		}
+	}
+}
+
 static void specialise(Module &m, Function &entry, const std::vector<ConstantValue> &values, bool dynamic)
 {
+	lower_expr_locations(m, entry);
 	if (dynamic) {
 		make_dynamic(m, entry);
 		for (Function &f : m) {
@@ -602,8 +674,14 @@ static std::vector<ArgInfo> parse_args(MDNode *list, bool outputs)
 			if (!s)
 				continue;
 			StringRef k = s->getString();
+			/* -1 when the operand is not a constant: binding indices given
+			 * by function-constant expressions ([[texture(expr)]], a global
+			 * the static initialiser sets; lower_expr_locations turned the
+			 * argument's uses into s8.texidx calls), or a global that was
+			 * optimised away */
 			auto int_at = [&](unsigned j) {
-				return (int)mdconst::extract<ConstantInt>(n->getOperand(j))->getZExtValue();
+				auto *c = j < n->getNumOperands() ? mdconst::dyn_extract_or_null<ConstantInt>(n->getOperand(j)) : nullptr;
+				return c ? (int)c->getZExtValue() : -1;
 			};
 			if (k == "air.function_constant") {
 				i++;    /* predicate node */
@@ -1041,7 +1119,22 @@ nir_shader *Translator::run()
 		n->cf_node.parent = &impl->cf_node;
 		blocks[&bb] = n;
 	}
-	for (BasicBlock &bb : f) {
+	/* Instructions are translated in reverse post-order, so a value is
+	 * translated before its uses also when a loop's latch comes before its
+	 * header in the function's block list (VideoToolbox's shaders: "no
+	 * value for"); blocks keep their NIR positions. Unreachable blocks
+	 * last. */
+	std::vector<BasicBlock *> order;
+	std::set<BasicBlock *> seen;
+	for (BasicBlock *bb : ReversePostOrderTraversal<Function *>(&f)) {
+		order.push_back(bb);
+		seen.insert(bb);
+	}
+	for (BasicBlock &bb : f)
+		if (!seen.count(&bb))
+			order.push_back(&bb);
+	for (BasicBlock *bbp : order) {
+		BasicBlock &bb = *bbp;
 		b.cursor = nir_after_block(blocks[&bb]);
 		for (PHINode &phi : bb.phis())
 			vals[&phi] = { nir_load_var(&b, phis[&phi]) };
@@ -1187,6 +1280,19 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 			nir_def *q = nir_vec3(&b, nir_ubitfield_extract_imm(&b, v, 11, 5),
 			    nir_ubitfield_extract_imm(&b, v, 5, 6), nir_ubitfield_extract_imm(&b, v, 0, 5));
 			r = nir_fmul(&b, nir_u2f32(&b, q), nir_imm_vec3(&b, 1.0 / 31, 1.0 / 63, 1.0 / 31));
+		} else if (bs == "pack" && kind == "unorm" && name.contains(".rgb10a2.")) {
+			/* air.pack.unorm.rgb10a2 (pack_float_to_unorm1010102): red in
+			 * bits 0-9, green 10-19, blue 20-29, alpha 30-31 */
+			nir_def *f = nir_fsat(&b, nir_f2f32(&b, x));
+			nir_def *q = nir_f2u32(&b, nir_fround_even(&b, nir_fmul(&b, f, nir_imm_vec4(&b, 1023.0, 1023.0, 1023.0, 3.0))));
+			nir_def *v = nir_ior(&b, nir_ior(&b, nir_channel(&b, q, 0), nir_ishl_imm(&b, nir_channel(&b, q, 1), 10)),
+			    nir_ior(&b, nir_ishl_imm(&b, nir_channel(&b, q, 2), 20), nir_ishl_imm(&b, nir_channel(&b, q, 3), 30)));
+			r = nir_u2uN(&b, v, bits(ci.getType()));
+		} else if (bs == "unpack" && kind == "unorm" && name.contains(".rgb10a2.")) {
+			nir_def *v = nir_u2u32(&b, x);
+			nir_def *q = nir_vec4(&b, nir_ubitfield_extract_imm(&b, v, 0, 10), nir_ubitfield_extract_imm(&b, v, 10, 10),
+			    nir_ubitfield_extract_imm(&b, v, 20, 10), nir_ubitfield_extract_imm(&b, v, 30, 2));
+			r = nir_fmul(&b, nir_u2f32(&b, q), nir_imm_vec4(&b, 1.0 / 1023, 1.0 / 1023, 1.0 / 1023, 1.0 / 3));
 		}
 		else
 			unsupported.push_back(name.str());
@@ -1331,6 +1437,12 @@ void Translator::emit_call(CallInst &ci)
 		emit_air(ci, name);
 		return;
 	}
+	if (name == "s8.texidx") {
+		/* a texture whose binding index a function-constant expression
+		 * gives (lower_expr_locations): the index, as texture "pointers" */
+		vals[&ci] = { nir_u2u64(&b, def(ci.getArgOperand(0))) };
+		return;
+	}
 	if (name == "s8.fcdef" || name.starts_with("s8.fc.")) {
 		unsigned index = (unsigned)cast<ConstantInt>(ci.getArgOperand(0))->getZExtValue();
 		nir_def *ubo = nir_imm_int(&b, S8_UBO_FC);
@@ -1366,6 +1478,17 @@ void Translator::emit_call(CallInst &ci)
 	if (auto *ii = dyn_cast<IntrinsicInst>(&ci)) {
 		switch (ii->getIntrinsicID()) {
 		case Intrinsic::fabs: vals[&ci] = { nir_fabs(&b, def(ii->getArgOperand(0))) }; return;
+		case Intrinsic::bswap: {
+			/* byte swap of a 32-bit value (VideoToolbox) */
+			nir_def *x = def(ii->getArgOperand(0));
+			if (x->bit_size != 32)
+				break;
+			nir_def *lo = nir_ior(&b, nir_ishl_imm(&b, nir_iand_imm(&b, x, 0xff), 24),
+			    nir_ishl_imm(&b, nir_iand_imm(&b, x, 0xff00), 8));
+			nir_def *hi = nir_ior(&b, nir_iand_imm(&b, nir_ushr_imm(&b, x, 8), 0xff00), nir_ushr_imm(&b, x, 24));
+			vals[&ci] = { nir_ior(&b, lo, hi) };
+			return;
+		}
 		case Intrinsic::sqrt: vals[&ci] = { nir_fsqrt(&b, def(ii->getArgOperand(0))) }; return;
 		case Intrinsic::floor: vals[&ci] = { nir_ffloor(&b, def(ii->getArgOperand(0))) }; return;
 		case Intrinsic::ceil: vals[&ci] = { nir_fceil(&b, def(ii->getArgOperand(0))) }; return;
