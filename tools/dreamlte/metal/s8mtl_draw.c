@@ -2409,7 +2409,13 @@ static void s8d_selftest(void)
 		memset(&rt16, 0, sizeof(rt16));
 		d.fs_name = "@test_fs16";
 		d.color_format = 115;
-		bool raw_ok = s8_mem_alloc(&rt16, W * H * 8, 256) == 0;
+		/* Only with boot-arg s8rawrt=1: in boot img1 backboardd died of
+		 * SIGILL (a Mesa unreachable/assert on the RAW path) right after
+		 * the image store test, in a loop, and iOS never drew. */
+		char args[1024] = "";
+		size_t alen = sizeof(args) - 1;
+		bool try_raw = sysctlbyname("kern.bootargs", args, &alen, NULL, 0) == 0 && strstr(args, "s8rawrt=1") != NULL;
+		bool raw_ok = try_raw && s8_mem_alloc(&rt16, W * H * 8, 256) == 0;
 		struct s8d_pipeline *p16 = raw_ok ? s8d_pipeline_new(&d, 9010) : NULL;
 		raw_ok = raw_ok && p16 != NULL;
 		s8g.selftesting = true;
