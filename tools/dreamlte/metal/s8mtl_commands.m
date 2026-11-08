@@ -248,11 +248,43 @@ static BOOL s8_diag(void)
 	return s8_diag_on && s8_diag_lines++ < 200;
 }
 
+/* A snapshot that started while a command buffer ran (its bindings were
+ * already past) stays on for the next whole command buffer. */
+static BOOL s8_diag_bound;
+
 static void s8_diag_done(void)
 {
-	if (s8_diag_on) {
+	if (s8_diag_on && s8_diag_bound) {
 		s8_diag_on = NO;
+		s8_diag_bound = NO;
 		s8_diag_next = s8_now_ns() + 20000000000ULL;
+	}
+}
+
+/* Low-resolution picture of a full-screen target after each pass of a
+ * snapshot frame: 32x32 blocks (one sample each), 6 bits a channel,
+ * base64, 30 pixels a line ("MTL ps SNAP PASS ROW PART: ..."). */
+static void s8_mini(S8Texture *t, unsigned snap, unsigned pass)
+{
+	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	if (t == nil || t->_cpu == NULL || t->_rowBytes == 0 || s8_format_bpp(t->_format) != 4 || t->_width < 1000)
+		return;
+	unsigned bw = (unsigned)t->_width / 32, bh = (unsigned)t->_height / 32;
+	s8_log("MTL ps %u %u: %ux%u of %lux%lu", snap, pass, bw, bh, (unsigned long)t->_width, (unsigned long)t->_height);
+	for (unsigned by = 0; by < bh; by++) {
+		char line[100];
+		unsigned n = 0, part = 0;
+		for (unsigned bx = 0; bx < bw; bx++) {
+			const uint8_t *px = t->_cpu + (by * 32 + 16) * t->_rowBytes + (bx * 32 + 16) * 4;
+			line[n++] = b64[px[2] >> 2];
+			line[n++] = b64[px[1] >> 2];
+			line[n++] = b64[px[0] >> 2];
+			if (n == 90 || bx + 1 == bw) {
+				line[n] = 0;
+				s8_log("MTL ps %u %u %u %u: %s", snap, pass, by, part++, line);
+				n = 0;
+			}
+		}
 	}
 }
 
@@ -328,6 +360,10 @@ void s8_shadow_refresh(void);
 			if (p->gpu >= 0 && s8d_pass_execute(_draw, p->gpu) == 0) {
 				gpu++;
 				s8_shot(p->target);
+				/* snapshot frames of an app (8 passes or more): the screen
+				 * after every pass, for the first 6 of them */
+				if (s8_diag_on && s8_diag_bound && _npasses >= 8 && s8_diag_n <= 12)
+					s8_mini(p->target, s8_diag_n, i);
 				/* where the colours go (boot tex1: the display only blue):
 				 * two raw texels of each of the first 80 full-screen
 				 * passes, centre and lower left */
@@ -404,6 +440,8 @@ static void s8_log_binding(unsigned stage, NSUInteger index, id t, int ok, const
 		return;
 	if ((ok ? logged++ >= 300 : failed++ >= 100) && !s8_diag())
 		return;
+	if (s8_diag_on)
+		s8_diag_bound = YES;
 	if (![t isKindOfClass:[S8Texture class]]) {
 		s8_log("MTL bind fs[%lu]: foreign %s", (unsigned long)index, class_getName(object_getClass(t)));
 		return;
