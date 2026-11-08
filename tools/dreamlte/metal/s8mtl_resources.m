@@ -402,7 +402,17 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 	out->format = (uint32_t)t->_format;
 	out->row_bytes = (uint32_t)t->_rowBytes;
 	out->gpu = t->_gpu;
-	if (out->gpu == 0 && t->_iosurface != NULL) {
+	/*
+	 * Small IOSurfaces the GPU only reads (layer backing stores: the text of
+	 * Settings' cells) are copied into GPU memory instead of mapped. The
+	 * kernel has 16 surface windows and reuses the least recently mapped:
+	 * a command buffer with more surfaces than that had the first ones
+	 * remapped before the GPU read them (text appeared, then broke on the
+	 * next refresh). Render targets and big surfaces stay mapped.
+	 */
+	BOOL shadow_surface = out->gpu == 0 && t->_iosurface != NULL && t->_cpu != NULL && t->_rowBytes != 0 &&
+	    !(t->_usage & 4 /* MTLTextureUsageRenderTarget */) && t->_rowBytes * t->_height <= (4u << 20);
+	if (out->gpu == 0 && t->_iosurface != NULL && !shadow_surface) {
 		/* The window stays valid until 16 other surfaces were mapped: map
 		 * at bind time, the command buffer runs right after encoding. */
 		struct s8mali_map_surface m = { .id = IOSurfaceGetID(t->_iosurface), .flags = S8MALI_MAP_FLUSH };
@@ -423,7 +433,8 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 	 * icon images: boot tex1 bound them as the null texture). The texels
 	 * are copied into GPU memory owned by the texture at every bind.
 	 */
-	if (out->gpu == 0 && t->_iosurface == NULL && t->_cpu != NULL && t->_rowBytes != 0 && t->_height != 0) {
+	if (out->gpu == 0 && (t->_iosurface == NULL || shadow_surface) && t->_cpu != NULL && t->_rowBytes != 0 &&
+	    t->_height != 0) {
 		NSUInteger size = t->_rowBytes * t->_height * (t->_depth ? t->_depth : 1);
 		/* never past the end of the backing buffer */
 		if (t->_parent != nil && [t->_parent isKindOfClass:[S8Buffer class]]) {
