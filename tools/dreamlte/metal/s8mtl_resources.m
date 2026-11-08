@@ -410,7 +410,17 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 	 * remapped before the GPU read them (text appeared, then broke on the
 	 * next refresh). Render targets and big surfaces stay mapped.
 	 */
-	BOOL shadow_surface = out->gpu == 0 && t->_iosurface != NULL && t->_cpu != NULL && t->_rowBytes != 0 &&
+	/* boot surf: not better (Settings' text maybe worse), so only with
+	 * boot-arg s8surfcopy=1 */
+	static int surfcopy = -1;
+	if (surfcopy < 0) {
+		int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+		char *strstr(const char *, const char *);
+		char args[1024] = "";
+		size_t alen = sizeof(args) - 1;
+		surfcopy = sysctlbyname("kern.bootargs", args, &alen, NULL, 0) == 0 && strstr(args, "s8surfcopy=1") != NULL;
+	}
+	BOOL shadow_surface = surfcopy && out->gpu == 0 && t->_iosurface != NULL && t->_cpu != NULL && t->_rowBytes != 0 &&
 	    !(t->_usage & 4 /* MTLTextureUsageRenderTarget */) && t->_rowBytes * t->_height <= (4u << 20);
 	if (out->gpu == 0 && t->_iosurface != NULL && !shadow_surface) {
 		/* The window stays valid until 16 other surfaces were mapped: map

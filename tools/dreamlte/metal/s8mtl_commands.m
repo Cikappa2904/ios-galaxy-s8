@@ -222,11 +222,36 @@ static void s8_cpu_clear(S8Texture *t, MTLClearColor c)
  * in shot1). 16x16 blocks averaged over 4x4 samples, 6 bits per channel,
  * base64 (3 characters a pixel), 30 pixels a line.
  */
+/*
+ * Diagnostic windows: the first 3 seconds of every minute from the first
+ * command buffer on (1:00, 2:00, ...), up to 250 lines each, every texture
+ * binding and render pass is logged, so what an app shows at that moment
+ * (Settings' text breaking on refresh) can be read back.
+ */
+static BOOL s8_diag(void)
+{
+	static uint64_t t0;
+	static unsigned lines;
+	static int win = -1;
+	uint64_t now = s8_now_ns();
+	if (t0 == 0)
+		t0 = now;
+	unsigned s = (unsigned)((now - t0) / 1000000000ULL);
+	if (s < 60 || s % 60 >= 3)
+		return NO;
+	if ((int)(s / 60) != win) {
+		win = (int)(s / 60);
+		lines = 0;
+		s8_log("MTL diag window %d (%u s)", win, s);
+	}
+	return lines++ < 250;
+}
+
 static void s8_shot(S8Texture *t)
 {
 	static uint64_t t0;
 	static unsigned taken[2];
-	static const unsigned at[] = { 20, 60, 150 };
+	static const unsigned at[] = { 61, 121, 181 };   /* with the diagnostic windows */
 	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	if (t == nil || t->_cpu == NULL || t->_width < 1000 || t->_height < 2000 || s8_format_bpp(t->_format) != 4)
 		return;
@@ -310,6 +335,15 @@ static void s8_shot(S8Texture *t)
 		}
 	}
 	s8_draws_total += draws;
+	if (s8_diag()) {
+		for (unsigned i = 0; i < _npasses; i++) {
+			struct s8_pass *p = &_passes[i];
+			S8Texture *tg = p->target;
+			s8_log("MTL diag pass %u/%u kind %d gpu %d: %lux%lu f%lu load %lu draws %u", i, _npasses, p->kind, p->gpu,
+			    tg ? (unsigned long)tg->_width : 0, tg ? (unsigned long)tg->_height : 0,
+			    tg ? (unsigned long)tg->_format : 0, (unsigned long)p->load, p->draws);
+		}
+	}
 	if (++s8_frames % 120 == 1)
 		s8_log("MTL command buffer %u: %u passes (%u on the GPU), %u CPU clears, %u blits, %u draws (%u so far)",
 		    s8_frames, _npasses, gpu, clears, blits, draws, s8_draws_total);
@@ -332,7 +366,7 @@ static void s8_log_binding(unsigned stage, NSUInteger index, id t, int ok, const
 	static unsigned logged, failed;
 	if (stage != S8D_STAGE_FRAGMENT || t == nil)
 		return;
-	if (ok ? logged++ >= 300 : failed++ >= 100)
+	if ((ok ? logged++ >= 300 : failed++ >= 100) && !s8_diag())
 		return;
 	if (![t isKindOfClass:[S8Texture class]]) {
 		s8_log("MTL bind fs[%lu]: foreign %s", (unsigned long)index, class_getName(object_getClass(t)));
@@ -341,14 +375,15 @@ static void s8_log_binding(unsigned stage, NSUInteger index, id t, int ok, const
 	S8Texture *x = t;
 	uint32_t first = 0, centre = 0;
 	unsigned bpp = s8_format_bpp(x->_format);
-	if (x->_cpu != NULL && bpp == 4 && x->_rowBytes) {
+	if (x->_cpu != NULL && x->_rowBytes && bpp && x->_width >= 2) {
 		memcpy(&first, x->_cpu, 4);
-		memcpy(&centre, x->_cpu + (x->_height / 2) * x->_rowBytes + (x->_width / 2) * 4, 4);
+		memcpy(&centre, x->_cpu + (x->_height / 2) * x->_rowBytes + (x->_width / 2) * bpp, 4);
 	}
-	s8_log("MTL bind fs[%lu]%s: %lux%lu fmt %lu gpu 0x%llx surf %u%s cpu %s px %08x/%08x", (unsigned long)index,
+	s8_log("MTL bind fs[%lu]%s: %lux%lu f%lu rb %lu u%lx gpu %llx s%u%s px %08x/%08x", (unsigned long)index,
 	    ok ? "" : " NULL", (unsigned long)x->_width, (unsigned long)x->_height, (unsigned long)x->_format,
+	    (unsigned long)x->_rowBytes, (unsigned long)x->_usage,
 	    (unsigned long long)(ok ? ref->gpu : x->_gpu), x->_iosurface ? IOSurfaceGetID(x->_iosurface) : 0,
-	    x->_parent != nil ? " view" : "", x->_cpu ? "yes" : "no", first, centre);
+	    x->_parent != nil ? " v" : "", first, centre);
 }
 
 static void s8_bind_texture(struct s8d_cmdbuf *d, unsigned stage, NSUInteger index, id t)
