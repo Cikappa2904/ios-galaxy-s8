@@ -733,6 +733,7 @@ public:
 	nir_shader *run();
 	std::vector<InlineSampler> inline_samplers;
 	std::vector<std::string> unsupported;
+	bool writes_images = false;
 	std::vector<uint8_t> constant_data;     /* UBO S8_UBO_DATA */
 
 private:
@@ -1189,6 +1190,20 @@ typedef nir_def *(*binop)(nir_builder *, nir_def *, nir_def *);
 typedef nir_def *(*triop)(nir_builder *, nir_def *, nir_def *, nir_def *);
 
 static nir_def *s8_fmix(nir_builder *b, nir_def *x, nir_def *y, nir_def *a) { return nir_flrp(b, x, y, a); }
+/* nir_image_store's macro mixes positional and designated initialisers,
+ * which C++ rejects: build the indices by hand. */
+static nir_def *s8_image_store(nir_builder *b, nir_def *idx, nir_def *coord, nir_def *v, nir_alu_type t)
+{
+	struct _nir_image_store_indices ix = {};
+	ix.image_dim = GLSL_SAMPLER_DIM_2D;
+	ix.image_array = false;
+	ix.format = PIPE_FORMAT_NONE;
+	ix.access = ACCESS_NON_READABLE;
+	ix.src_type = t;
+	_nir_build_image_store(b, idx, coord, nir_imm_int(b, 0), v, nir_imm_int(b, 0), ix);
+	return NULL;
+}
+
 static nir_def *s8_fclamp(nir_builder *b, nir_def *x, nir_def *lo, nir_def *hi) { return nir_fmin(b, nir_fmax(b, x, lo), hi); }
 static nir_def *s8_powr(nir_builder *b, nir_def *x, nir_def *y) { return nir_fpow(b, x, y); }
 static nir_def *s8_log_e(nir_builder *b, nir_def *x) { return nir_fmul_imm(b, nir_flog2(b, x), 0.69314718055994530942); }
@@ -1382,7 +1397,33 @@ void Translator::emit_air(CallInst &ci, StringRef name)
 		vals[&ci] = { &tex->def, nir_imm_intN_t(&b, 0, 8) };
 		return;
 	} else if (bs == "write_texture_2d") {
-		unsupported.push_back("image write (" + name.str() + ")");
+		/* air.write_texture_2d[.<coord type>][.u|.s].<value type>(texture,
+		 * coord, value, lod, access): an image store. On Bifrost v6 images
+		 * are attribute records (LEA_ATTR_TEX in the primary table, index =
+		 * the Metal texture index; the driver fills the fragment stage's
+		 * attribute table from the bound textures) and ST_CVT takes 32-bit
+		 * values only. */
+		nir_def *idx = nir_u2u32(&b, def(ci.getArgOperand(0)));
+		nir_def *c = nir_u2u32(&b, def(ci.getArgOperand(1)));
+		nir_def *coord = nir_vec4(&b, nir_channel(&b, c, 0), nir_channel(&b, c, 1), nir_imm_int(&b, 0),
+		    nir_imm_int(&b, 0));
+		nir_def *v = def(ci.getArgOperand(2));
+		Type *vt = ci.getArgOperand(2)->getType()->getScalarType();
+		bool is_float = vt->isFloatingPointTy();
+		bool is_signed = name.contains(".s.v");
+		if (is_float)
+			v = nir_f2f32(&b, v);
+		else
+			v = is_signed ? nir_i2i32(&b, v) : nir_u2u32(&b, v);
+		if (v->num_components < 4) {
+			nir_def *ch[4];
+			for (unsigned k = 0; k < 4; k++)
+				ch[k] = k < v->num_components ? nir_channel(&b, v, k) :
+				    (is_float ? nir_imm_float(&b, k == 3 ? 1.0f : 0.0f) : nir_imm_int(&b, k == 3 ? 1 : 0));
+			v = nir_vec(&b, ch, 4);
+		}
+		s8_image_store(&b, idx, coord, v, is_float ? nir_type_float32 : (is_signed ? nir_type_int32 : nir_type_uint32));
+		writes_images = true;
 		return;
 	} else if (bs.starts_with("get_null_texture")) {
 		vals[&ci] = { nir_imm_int64(&b, S8_NULL_TEXTURE) };
@@ -1942,6 +1983,16 @@ static nir_shader *test_shader(int mode)
 	nir_builder b = nir_builder_init_simple_shader(vertex ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT,
 	    pan_shader_get_compiler_options(6), vertex ? "s8-test-vs" : "s8-test-fs");
 	nir_def *k = s8_load_ubo(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0), 16);
+	if (mode == 4) {
+		/* "@test_imgw": constant buffer 0's float4 stored into image 1 at
+		 * the fragment's pixel (image stores), and also its colour */
+		nir_def *fc = nir_f2i32(&b, nir_load_frag_coord(&b));
+		nir_def *coord = nir_vec4(&b, nir_channel(&b, fc, 0), nir_channel(&b, fc, 1), nir_imm_int(&b, 0),
+		    nir_imm_int(&b, 0));
+		s8_image_store(&b, nir_imm_int(&b, 1), coord, k, nir_type_float32);
+		nir_store_var(&b, test_var(b.shader, nir_var_shader_out, "color", glsl_vec4_type(), FRAG_RESULT_DATA0), k, 0xf);
+		return b.shader;
+	}
 	if (mode == 2 || mode == 3) {
 		const glsl_type *h4 = glsl_vector_type(GLSL_TYPE_FLOAT16, 4);
 		nir_def *v;
@@ -2063,13 +2114,15 @@ int main(int argc, char **argv)
 	std::vector<InlineSampler> inline_samplers;
 	std::vector<uint8_t> constant_data;
 	std::vector<std::string> unsupported;
+	bool writes_images = false;
 	if (fname == "@preload") {
 		/* the driver's frame shader for MTLLoadActionLoad (lib = unused) */
 		stage = MESA_SHADER_FRAGMENT;
 		s = preload_shader();
-	} else if (fname == "@test_vs" || fname == "@test_fs" || fname == "@test_fs16" || fname == "@test_fbf") {
+	} else if (fname == "@test_vs" || fname == "@test_fs" || fname == "@test_fs16" || fname == "@test_fbf" || fname == "@test_imgw") {
 		stage = fname == "@test_vs" ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT;
-		s = test_shader(fname == "@test_vs" ? 0 : fname == "@test_fs" ? 1 : fname == "@test_fs16" ? 2 : 3);
+		s = test_shader(fname == "@test_vs" ? 0 : fname == "@test_fs" ? 1 : fname == "@test_fs16" ? 2 : fname == "@test_fbf" ? 3 : 4);
+		writes_images = fname == "@test_imgw";
 	} else {
 		MetallibFunction *fn = nullptr;
 		funcs = read_metallib(lib);
@@ -2097,6 +2150,7 @@ int main(int argc, char **argv)
 		inline_samplers = tr.inline_samplers;
 		constant_data = tr.constant_data;
 		unsupported = tr.unsupported;
+		writes_images = tr.writes_images;
 		for (auto &u : unsupported)
 			fprintf(stderr, "air2nir: unsupported: %s\n", u.c_str());
 	}
@@ -2163,6 +2217,11 @@ int main(int argc, char **argv)
 	 * textures_used (empty here): a fragment shader sampling with inline
 	 * sampler 16 and counts 0 faulted with ADDRESS_RANGE (0x5a). */
 	info.texture_count = 32;
+	/* Image stores (write_texture_2d): the driver binds the fragment
+	 * stage's 32 textures as images in the attribute table, which the G71
+	 * range-checks against the RSD's attribute count. */
+	if (writes_images && stage == MESA_SHADER_FRAGMENT)
+		info.attribute_count = 32;
 	info.sampler_count = 32;
 
 	fprintf(stderr, "air2nir: %s: %u bytes, %u work registers, %u attributes, %u UBOs, %u textures, "
@@ -2201,6 +2260,7 @@ int main(int argc, char **argv)
 		flags |= info.fs.reads_frag_coord ? 2 : 0;
 		flags |= info.fs.writes_depth ? 4 : 0;
 		flags |= info.fs.outputs_read ? 8 : 0;
+		flags |= writes_images ? 16 : 0;
 	}
 	put(flags);
 	/* RSD template: pack twice with different shader pointers to find the

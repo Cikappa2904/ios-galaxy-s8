@@ -975,7 +975,7 @@ struct s8d_pipeline *s8d_pipeline_new(const struct s8d_pipeline_desc *d, unsigne
 			cfg.stencil_front.depth_pass = MALI_STENCIL_OP_KEEP;
 			cfg.stencil_front.mask = 0xFF;
 			cfg.stencil_back = cfg.stencil_front;
-			bool side = (p->fs->fs_flags & (1 | 4 | 8)) != 0;
+			bool side = (p->fs->fs_flags & (1 | 4 | 8 | 16)) != 0;     /* 16: image stores */
 			cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
 			cfg.properties.pixel_kill_operation = side ? MALI_PIXEL_KILL_WEAK_EARLY : MALI_PIXEL_KILL_FORCE_EARLY;
 			cfg.properties.allow_forward_pixel_to_kill = opaque && !side;
@@ -1047,6 +1047,7 @@ struct s8_stage_state {
 	bool sampler_set[S8D_MAX_SAMPLERS];
 	/* descriptor tables built for the current bindings (0: rebuild) */
 	uint64_t ubos, textures_desc, samplers_desc, addrs;
+	uint64_t images_desc, image_bufs;     /* bound textures as images (attribute table) */
 	struct s8d_pipeline *for_pipeline;
 };
 
@@ -1213,6 +1214,7 @@ void s8d_set_texture(struct s8d_cmdbuf *cb, unsigned stage, unsigned index, cons
 		s->textures[index] = *t;
 	s->texture_set[index] = t != NULL && t->gpu != 0;
 	s->textures_desc = 0;
+	s->images_desc = 0;
 }
 
 void s8d_set_sampler(struct s8d_cmdbuf *cb, unsigned stage, unsigned index, const struct s8d_sampler *smp)
@@ -1355,6 +1357,64 @@ static uint64_t s8_texture_table(struct s8d_cmdbuf *cb, struct s8_stage_state *s
 	}
 	s->textures_desc = d.gpu;
 	return d.gpu;
+}
+
+/*
+ * Image table for shaders that store to images (air2nir: write_texture_2d,
+ * attribute_count 32): the stage's bound textures as attribute records, as
+ * Panfrost's emit_image_attribs/emit_image_bufs do on v6 -- ATTRIBUTE i ->
+ * buffers 2i (3D linear) and 2i+1 (3D continuation), plus an empty buffer
+ * that stops Bifrost's prefetch. Unbound slots get empty buffers.
+ */
+static uint64_t s8_image_table(struct s8d_cmdbuf *cb, struct s8_stage_state *s, uint64_t *bufs_gpu)
+{
+	if (s->images_desc) {
+		*bufs_gpu = s->image_bufs;
+		return s->images_desc;
+	}
+	const unsigned n = S8_TEX_COUNT;
+	struct s8_ptr attrs = s8_alloc_descs(&cb->arena, n, ATTRIBUTE);
+	struct s8_ptr bufs = s8_alloc_descs(&cb->arena, 2 * n + 1, ATTRIBUTE_BUFFER);
+	if (!attrs.cpu || !bufs.cpu)
+		return 0;
+	struct mali_attribute_buffer_packed *b = bufs.cpu;
+	for (unsigned i = 0; i < n; i++) {
+		const struct s8d_texture *t = i < S8D_MAX_TEXTURES && s->texture_set[i] ? &s->textures[i] : NULL;
+		enum pipe_format pf = t ? s8_pixel_format(t->format) : PIPE_FORMAT_NONE;
+		if (t != NULL && (t->gpu == 0 || t->row_bytes == 0))
+			pf = PIPE_FORMAT_NONE;
+		pan_pack((struct mali_attribute_packed *)attrs.cpu + i, ATTRIBUTE, cfg) {
+			cfg.buffer_index = i * 2;
+			cfg.offset_enable = false;
+			cfg.format = GENX(pan_format_from_pipe_format)(pf != PIPE_FORMAT_NONE ? pf :
+			    PIPE_FORMAT_R8G8B8A8_UNORM)->hw;
+		}
+		if (pf == PIPE_FORMAT_NONE) {
+			pan_pack(&b[i * 2], ATTRIBUTE_BUFFER, cfg)
+				;
+			pan_pack(&b[i * 2 + 1], ATTRIBUTE_BUFFER, cfg)
+				;
+			continue;
+		}
+		pan_pack(&b[i * 2], ATTRIBUTE_BUFFER, cfg) {
+			cfg.type = MALI_ATTRIBUTE_TYPE_3D_LINEAR;
+			cfg.pointer = t->gpu;
+			cfg.stride = util_format_get_blocksize(pf);
+			cfg.size = (uint32_t)t->row_bytes * t->height;
+		}
+		pan_cast_and_pack(&b[i * 2 + 1], ATTRIBUTE_BUFFER_CONTINUATION_3D, cfg) {
+			cfg.s_dimension = t->width;
+			cfg.t_dimension = t->height;
+			cfg.r_dimension = 1;
+			cfg.row_stride = t->row_bytes;
+		}
+	}
+	pan_pack(&b[2 * n], ATTRIBUTE_BUFFER, cfg)
+		;
+	s->images_desc = attrs.gpu;
+	s->image_bufs = bufs.gpu;
+	*bufs_gpu = bufs.gpu;
+	return attrs.gpu;
 }
 
 static uint64_t s8_sampler_table(struct s8d_cmdbuf *cb, struct s8_stage_state *s, const struct s8_shader *sh)
@@ -1681,6 +1741,11 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 	uint64_t fs_ubos = s8_ubo_table(cb, fst, pl->fs, pl->fs_fc, pl->fs_fc_size, sv[1].gpu);
 	uint64_t vs_tex = s8_texture_table(cb, vst, pl->vs), fs_tex = s8_texture_table(cb, fst, pl->fs);
 	uint64_t vs_smp = s8_sampler_table(cb, vst, pl->vs), fs_smp = s8_sampler_table(cb, fst, pl->fs);
+	/* fragment shaders that store to images (their RSD attribute count is
+	 * 32): the bound textures as images */
+	uint64_t fs_images = 0, fs_image_bufs = 0;
+	if (pl->fs->attribute_count != 0)
+		fs_images = s8_image_table(cb, fst, &fs_image_bufs);
 	vst->for_pipeline = fst->for_pipeline = pl;
 	uint64_t attribs = 0, attrib_bufs = 0;
 	if (s8_attributes(cb, pl, padded, instances, &attribs, &attrib_bufs) != 0 || !vs_ubos || !fs_ubos || !viewport) {
@@ -1814,6 +1879,8 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 		cfg.uniform_buffers = fs_ubos;
 		cfg.textures = fs_tex;
 		cfg.samplers = fs_smp;
+		cfg.attributes = fs_images;
+		cfg.attribute_buffers = fs_image_bufs;
 	}
 	pan_section_pack(tj.cpu, TILER_JOB, TILER, cfg) {
 		cfg.address = p->tiler_ctx.gpu;
@@ -2181,6 +2248,16 @@ int s8d_pass_execute(struct s8d_cmdbuf *cb, int idx)
  * its conversion), the private display formats 550/554 and A8 glyph
  * textures.
  */
+/* |half - want| small (self-test of RGBA16F targets) */
+static bool s8_half_close(uint16_t h, float want)
+{
+	int e = (h >> 10) & 0x1f, m = h & 0x3ff;
+	float v = e == 0 ? m / 16777216.0f : (1.0f + m / 1024.0f) * (float)(1u << e) / 32768.0f;
+	if (h & 0x8000)
+		v = -v;
+	return v > want - 0.004f && v < want + 0.004f;
+}
+
 static void s8d_selftest(void)
 {
 #ifndef S8_TEST
@@ -2274,6 +2351,116 @@ static void s8d_selftest(void)
 	s8_log("MTL selftest: %u of %u OK", good, (unsigned)(sizeof(t) / sizeof(t[0])));
 	for (unsigned i = 0; i < 3; i++)
 		s8d_pipeline_free(pl[i]);
+
+	struct s8d_pipeline_desc d;
+	memset(&d, 0, sizeof(d));
+	d.vs_name = "@test_vs";
+	d.vs_constants = d.fs_constants = "";
+	d.write_mask = 0xf;
+	d.attribs[0] = (struct s8d_vertex_attrib){ 29, 0, 0 };
+	d.attribs[1] = (struct s8d_vertex_attrib){ 29, 8, 0 };
+	d.layouts[0] = (struct s8d_vertex_layout){ 16, 1, 1 };
+	static const float quarter[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+	static const float one[4] = { 1, 1, 1, 1 };
+
+	/* Image stores (write_texture_2d: RenderBox's resolve shaders draw the
+	 * lock screen poster with them): @test_imgw writes 0.25/0.5/0.75/1 into
+	 * image 1 at every pixel. */
+	{
+		s8_mem img;
+		memset(&img, 0, sizeof(img));
+		d.fs_name = "@test_imgw";
+		d.color_format = 80;
+		struct s8d_pipeline *pw = s8_mem_alloc(&img, W * H * 4, 256) == 0 ? s8d_pipeline_new(&d, 9011) : NULL;
+		struct s8d_cmdbuf *cb = pw ? calloc(1, sizeof(*cb)) : NULL;
+		if (cb != NULL) {
+			cb->current = -1;
+			memset(img.cpu, 0, W * H * 4);
+			struct s8d_texture target = { rt.gpu, W, H, W * 4, 80 };
+			struct s8d_texture image = { img.gpu, W, H, W * 4, 80 };
+			double clear[4] = { 0, 0, 0, 0 };
+			int pass = s8d_pass_begin(cb, &target, 2, clear);
+			s8d_set_pipeline(cb, pw);
+			s8d_set_buffer(cb, S8D_STAGE_VERTEX, 0, vb.gpu, vb.cpu, 64);
+			s8d_set_bytes(cb, S8D_STAGE_VERTEX, 1, one, sizeof(one));
+			s8d_set_bytes(cb, S8D_STAGE_FRAGMENT, 0, quarter, sizeof(quarter));
+			s8d_set_texture(cb, S8D_STAGE_FRAGMENT, 1, &image);
+			s8d_set_viewport(cb, 0, 0, W, H, 0, 1);
+			s8d_draw(cb, 4, 0, 4, 1, 0, 0, NULL);
+			s8d_pass_end(cb);
+			int r = pass >= 0 ? s8d_pass_execute(cb, pass) : -1;
+			s8d_cmdbuf_free(cb);
+			volatile uint32_t *ip = img.cpu;
+			uint32_t c = ip[(H / 2) * W + W / 2], e = ip[3 * W + 3];
+			bool ok = r == 0 && c == 0xff4080bf && e == 0xff4080bf;
+			s8_log("MTL selftest image store: %s run %d, %08x %08x, expected ff4080bf", ok ? "OK" : "BAD", r, c, e);
+		} else {
+			s8_log("MTL selftest image store: no pipeline");
+		}
+		s8d_pipeline_free(pw);
+		s8_mem_free(&img);
+	}
+
+	/* RGBA16F (RAW) render targets: a clear and a half-float draw. Only
+	 * when both come out right does the driver render to such targets
+	 * (CoreAnimation's blurs and materials; skipped before). */
+	{
+		s8_mem rt16;
+		memset(&rt16, 0, sizeof(rt16));
+		d.fs_name = "@test_fs16";
+		d.color_format = 115;
+		bool raw_ok = s8_mem_alloc(&rt16, W * H * 8, 256) == 0;
+		struct s8d_pipeline *p16 = raw_ok ? s8d_pipeline_new(&d, 9010) : NULL;
+		raw_ok = raw_ok && p16 != NULL;
+		s8g.selftesting = true;
+		for (unsigned k = 0; k < 2 && raw_ok; k++) {
+			static const float want[2][4] = {
+				{ 0.25f, 0.5f, 0.75f, 1.0f },
+				{ 128 / 255.0f, 64 / 255.0f, 16 / 255.0f, 192 / 255.0f },
+			};
+			memset(rt16.cpu, 0xff, W * H * 8);
+			struct s8d_texture target = { rt16.gpu, W, H, W * 8, 115 };
+			struct s8d_texture src = { tex.gpu, 16, 16, 64, 80 };
+			struct s8d_sampler smp = { .normalized = 1 };
+			double clear[4] = { 0.25, 0.5, 0.75, 1 };
+			struct s8d_cmdbuf *cb = calloc(1, sizeof(*cb));
+			if (cb == NULL) {
+				raw_ok = false;
+				break;
+			}
+			cb->current = -1;
+			int pass = s8d_pass_begin(cb, &target, 2, clear);
+			if (k == 1) {
+				s8d_set_pipeline(cb, p16);
+				s8d_set_buffer(cb, S8D_STAGE_VERTEX, 0, vb.gpu, vb.cpu, 64);
+				s8d_set_bytes(cb, S8D_STAGE_VERTEX, 1, one, sizeof(one));
+				s8d_set_bytes(cb, S8D_STAGE_FRAGMENT, 0, one, sizeof(one));
+				s8d_set_texture(cb, S8D_STAGE_FRAGMENT, 0, &src);
+				s8d_set_sampler(cb, S8D_STAGE_FRAGMENT, 0, &smp);
+				s8d_set_viewport(cb, 0, 0, W, H, 0, 1);
+				s8d_draw(cb, 4, 0, 4, 1, 0, 0, NULL);
+			}
+			s8d_pass_end(cb);
+			int r = pass >= 0 ? s8d_pass_execute(cb, pass) : -1;
+			s8d_cmdbuf_free(cb);
+			volatile uint16_t *h = rt16.cpu;
+			bool ok = r == 0;
+			for (unsigned at = 0; at < 2; at++) {
+				unsigned px = at ? 3 * W + 3 : (H / 2) * W + W / 2;
+				for (unsigned c = 0; c < 4; c++)
+					ok = ok && s8_half_close(h[px * 4 + c], want[k][c]);
+			}
+			unsigned px = (H / 2) * W + W / 2;
+			s8_log("MTL selftest RGBA16F %s: %s run %d, %04x %04x %04x %04x", k ? "draw f16" : "clear",
+			    ok ? "OK" : "BAD", r, h[px * 4], h[px * 4 + 1], h[px * 4 + 2], h[px * 4 + 3]);
+			raw_ok = raw_ok && ok;
+		}
+		s8g.selftesting = false;
+		s8g.raw_rt_ok = raw_ok;
+		s8_log("MTL selftest: RGBA16F render targets %s", raw_ok ? "on" : "off (skipped)");
+		s8d_pipeline_free(p16);
+		s8_mem_free(&rt16);
+	}
 out:
 	s8_mem_free(&rt);
 	s8_mem_free(&tex);
