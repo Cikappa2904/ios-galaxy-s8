@@ -228,23 +228,46 @@ static void s8_cpu_clear(S8Texture *t, MTLClearColor c)
  * binding and render pass is logged, so what an app shows at that moment
  * (Settings' text breaking on refresh) can be read back.
  */
+/* Boot diag2's minute windows caught nothing (iOS draws ~1.5 frames a
+ * second when idle): instead, the first command buffer after every 20 s
+ * is logged whole (bindings while it is encoded, passes when it runs). */
+static uint64_t s8_diag_next;
+static BOOL s8_diag_on;
+static unsigned s8_diag_lines, s8_diag_n;
+
 static BOOL s8_diag(void)
 {
-	static uint64_t t0;
-	static unsigned lines;
-	static int win = -1;
 	uint64_t now = s8_now_ns();
-	if (t0 == 0)
-		t0 = now;
-	unsigned s = (unsigned)((now - t0) / 1000000000ULL);
-	if (s < 60 || s % 60 >= 3)
-		return NO;
-	if ((int)(s / 60) != win) {
-		win = (int)(s / 60);
-		lines = 0;
-		s8_log("MTL diag window %d (%u s)", win, s);
+	if (s8_diag_next == 0)
+		s8_diag_next = now + 30000000000ULL;
+	if (!s8_diag_on && now >= s8_diag_next && s8_diag_n < 30) {
+		s8_diag_on = YES;
+		s8_diag_lines = 0;
+		s8_log("MTL diag snapshot %u", ++s8_diag_n);
 	}
-	return lines++ < 250;
+	return s8_diag_on && s8_diag_lines++ < 200;
+}
+
+static void s8_diag_done(void)
+{
+	if (s8_diag_on) {
+		s8_diag_on = NO;
+		s8_diag_next = s8_now_ns() + 20000000000ULL;
+	}
+}
+
+/* IOSurfaces mapped for the command buffer being encoded (the kernel has
+ * 16 windows): more than 16 distinct ones are logged when it runs. */
+static uint32_t s8_cb_surf[64];
+static unsigned s8_cb_nsurf;
+
+void s8_note_surface(uint32_t id)
+{
+	for (unsigned i = 0; i < s8_cb_nsurf; i++)
+		if (s8_cb_surf[i] == id)
+			return;
+	if (s8_cb_nsurf < 64)
+		s8_cb_surf[s8_cb_nsurf++] = id;
 }
 
 static void s8_shot(S8Texture *t)
@@ -343,6 +366,15 @@ static void s8_shot(S8Texture *t)
 			    tg ? (unsigned long)tg->_width : 0, tg ? (unsigned long)tg->_height : 0,
 			    tg ? (unsigned long)tg->_format : 0, (unsigned long)p->load, p->draws);
 		}
+		s8_log("MTL diag cb: %u passes, %u IOSurfaces mapped", _npasses, s8_cb_nsurf);
+	}
+	s8_diag_done();
+	{
+		static unsigned over_logged;
+		if (s8_cb_nsurf > 16 && over_logged++ < 60)
+			s8_log("MTL cb: %u IOSurfaces mapped (> 16 kernel windows), %u passes, %u draws", s8_cb_nsurf,
+			    _npasses, draws);
+		s8_cb_nsurf = 0;
 	}
 	if (++s8_frames % 120 == 1)
 		s8_log("MTL command buffer %u: %u passes (%u on the GPU), %u CPU clears, %u blits, %u draws (%u so far)",

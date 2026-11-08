@@ -432,6 +432,8 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 			return -1;
 		}
 		out->gpu = m.gpu_va;
+		void s8_note_surface(uint32_t id);
+		s8_note_surface(m.id);
 		if (t->_plane != 0 && logged++ < 10)
 			s8_log("MTL IOSurface %u plane %lu: plane offsets not handled", m.id, (unsigned long)t->_plane);
 		if (m.bytes_per_row)
