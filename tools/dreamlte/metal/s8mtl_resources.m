@@ -391,6 +391,48 @@ S8_FORWARDING
 S8_FORWARDING
 @end
 
+/*
+ * Copied textures bound since the last command buffer ran. CoreAnimation
+ * adds glyphs to its atlas (a NoCopy-buffer A8 texture) while it encodes a
+ * frame: the copy taken at bind time could miss them (Settings' text came
+ * and went). They are copied again right before the command buffer runs
+ * (s8_shadow_refresh, s8mtl_commands.m).
+ */
+static struct { S8Texture *t; NSUInteger size; } s8_shadows[512];
+static unsigned s8_nshadows;
+static int s8_shadow_lock;      /* command buffers may be encoded on several threads */
+
+static void s8_shadow_note(S8Texture *t, NSUInteger size)
+{
+	while (__atomic_exchange_n(&s8_shadow_lock, 1, __ATOMIC_ACQUIRE))
+		;
+	for (unsigned i = 0; i < s8_nshadows; i++)
+		if (s8_shadows[i].t == t) {
+			__atomic_store_n(&s8_shadow_lock, 0, __ATOMIC_RELEASE);
+			return;
+		}
+	if (s8_nshadows < 512) {
+		s8_shadows[s8_nshadows].t = [t retain];
+		s8_shadows[s8_nshadows].size = size;
+		s8_nshadows++;
+	}
+	__atomic_store_n(&s8_shadow_lock, 0, __ATOMIC_RELEASE);
+}
+
+void s8_shadow_refresh(void)
+{
+	while (__atomic_exchange_n(&s8_shadow_lock, 1, __ATOMIC_ACQUIRE))
+		;
+	for (unsigned i = 0; i < s8_nshadows; i++) {
+		S8Texture *t = s8_shadows[i].t;
+		if (t->_shadow.cpu != NULL && t->_cpu != NULL && s8_shadows[i].size <= t->_shadowSize)
+			memcpy(t->_shadow.cpu, t->_cpu, s8_shadows[i].size);
+		[t release];
+	}
+	s8_nshadows = 0;
+	__atomic_store_n(&s8_shadow_lock, 0, __ATOMIC_RELEASE);
+}
+
 int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 {
 	static unsigned logged;
@@ -468,6 +510,7 @@ int s8_texture_ref(S8Texture *t, struct s8d_texture *out)
 		if (t->_shadow.gpu != 0) {
 			memcpy(t->_shadow.cpu, t->_cpu, size);
 			out->gpu = t->_shadow.gpu;
+			s8_shadow_note(t, size);
 		} else if (logged++ < 10) {
 			s8_log("MTL texture %lux%lu fmt %lu: no GPU memory for its copy", (unsigned long)t->_width,
 			    (unsigned long)t->_height, (unsigned long)t->_format);

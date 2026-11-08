@@ -314,9 +314,13 @@ static void s8_shot(S8Texture *t)
 	}
 }
 
+void s8_shadow_refresh(void);
+
 - (void)s8_execute
 {
 	unsigned draws = 0, clears = 0, blits = 0, gpu = 0;
+	/* copied textures again, with what was written since they were bound */
+	s8_shadow_refresh();
 	for (unsigned i = 0; i < _npasses; i++) {
 		struct s8_pass *p = &_passes[i];
 		if (p->kind == 1) {
