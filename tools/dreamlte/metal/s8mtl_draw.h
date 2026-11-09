@@ -82,6 +82,10 @@ void s8d_pipeline_free(struct s8d_pipeline *p);
 
 struct s8d_cmdbuf *s8d_cmdbuf_new(void);
 void s8d_cmdbuf_free(struct s8d_cmdbuf *cb);
+/* Takes again the copies of CPU memory made while draws were encoded
+ * (Metal: buffer contents count as of the commit); copies counted, and
+ * those whose source changed since. Call right before running it. */
+void s8d_cmdbuf_refresh(struct s8d_cmdbuf *cb, unsigned *copies, unsigned *changed);
 
 /* Render pass: load is MTLLoadAction (0 don't care, 1 load, 2 clear).
  * Returns the pass index for s8d_pass_execute, or -1 (the pass is skipped,

@@ -12,6 +12,7 @@ struct s8d_pipeline *s8d_pipeline_new(const struct s8d_pipeline_desc *d, unsigne
 void s8d_pipeline_free(struct s8d_pipeline *p) { (void)p; }
 struct s8d_cmdbuf *s8d_cmdbuf_new(void) { return NULL; }
 void s8d_cmdbuf_free(struct s8d_cmdbuf *cb) { (void)cb; }
+void s8d_cmdbuf_refresh(struct s8d_cmdbuf *cb, unsigned *copies, unsigned *changed) { (void)cb; *copies = *changed = 0; }
 int s8d_pass_begin(struct s8d_cmdbuf *cb, const struct s8d_texture *t, unsigned load, const double c[4])
 {
 	(void)cb; (void)t; (void)load; (void)c;

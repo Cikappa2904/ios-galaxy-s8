@@ -1070,7 +1070,19 @@ struct s8_pass {
 	unsigned njobs;
 };
 
+/* A copy of CPU memory (NoCopy buffer, unaligned UBO range, indices) taken
+ * while a draw was encoded, taken again right before the command buffer
+ * runs (s8d_cmdbuf_refresh): Metal lets the app fill a buffer after encoding
+ * the draws that use it, up to the commit. */
+struct s8_late {
+	void *dst;
+	const void *src;
+	uint32_t len;
+};
+
 struct s8d_cmdbuf {
+	struct s8_late *late;
+	unsigned nlate, late_cap;
 	struct s8_arena arena;
 	struct s8_pass *passes;
 	unsigned npasses, cap;
@@ -1099,10 +1111,39 @@ struct s8d_cmdbuf *s8d_cmdbuf_new(void)
 	return cb;
 }
 
+static void s8_late_note(struct s8d_cmdbuf *cb, void *dst, const void *src, uint64_t len)
+{
+	if (cb->nlate == cb->late_cap) {
+		unsigned cap = cb->late_cap ? cb->late_cap * 2 : 64;
+		struct s8_late *l = realloc(cb->late, cap * sizeof(*l));
+		if (l == NULL)
+			return;
+		cb->late = l;
+		cb->late_cap = cap;
+	}
+	cb->late[cb->nlate++] = (struct s8_late){ dst, src, (uint32_t)len };
+}
+
+void s8d_cmdbuf_refresh(struct s8d_cmdbuf *cb, unsigned *copies, unsigned *changed)
+{
+	*copies = *changed = 0;
+	if (cb == NULL)
+		return;
+	for (unsigned i = 0; i < cb->nlate; i++) {
+		struct s8_late *l = &cb->late[i];
+		(*copies)++;
+		if (memcmp(l->dst, l->src, l->len) != 0) {
+			(*changed)++;
+			memcpy(l->dst, l->src, l->len);
+		}
+	}
+}
+
 void s8d_cmdbuf_free(struct s8d_cmdbuf *cb)
 {
 	if (cb == NULL)
 		return;
+	free(cb->late);
 	s8_arena_release(&cb->arena);
 	free(cb->passes);
 	free(cb);
@@ -1467,6 +1508,7 @@ static uint64_t s8_ubo_table(struct s8d_cmdbuf *cb, struct s8_stage_state *s, co
 				if (c.cpu != NULL) {
 					memcpy(c.cpu, s->buffers[i].cpu, size);
 					ptr = c.gpu;
+					s8_late_note(cb, c.cpu, s->buffers[i].cpu, size);
 				}
 			}
 			if (ptr & 15) {
@@ -1512,6 +1554,7 @@ static void s8_gpu_visible(struct s8d_cmdbuf *cb, struct s8_binding *b)
 		return;
 	memcpy(p.cpu, b->cpu, b->length);
 	b->gpu = p.gpu;
+	s8_late_note(cb, p.cpu, b->cpu, b->length);
 }
 
 static uint64_t s8_viewport(struct s8d_cmdbuf *cb, struct s8_pass *p, float sysval[8])
@@ -1707,6 +1750,7 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 			}
 			memcpy(ib.cpu, ic, (size_t)count * index_size);
 			index_gpu = ib.gpu;
+			s8_late_note(cb, ib.cpu, ic, (uint64_t)count * index_size);
 		}
 		indices = index_gpu;
 	}

@@ -353,6 +353,20 @@ void s8_shadow_refresh(void);
 	unsigned draws = 0, clears = 0, blits = 0, gpu = 0;
 	/* copied textures again, with what was written since they were bound */
 	s8_shadow_refresh();
+	/* and the CPU buffer data copied while draws were encoded: whether it
+	 * changed since is the test of boot diag5's empty Settings frames */
+	{
+		static unsigned frames, logged;
+		static uint64_t tot_copies, tot_changed;
+		unsigned copies, changed;
+		s8d_cmdbuf_refresh(_draw, &copies, &changed);
+		tot_copies += copies;
+		tot_changed += changed;
+		frames++;
+		if ((changed && logged++ < 30) || frames % 300 == 0)
+			s8_log("MTL late writes: %u of %u copies changed after encoding (total %llu of %llu)", changed,
+			    copies, (unsigned long long)tot_changed, (unsigned long long)tot_copies);
+	}
 	/* Per-pass pictures of complex frames (12 passes or more: an app such
 	 * as Settings, not the lock screen; boot diag4's timed snapshots all
 	 * fell on the lock screen): one frame every 10 s at most, 10 frames. */
