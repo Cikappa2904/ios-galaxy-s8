@@ -353,6 +353,17 @@ void s8_shadow_refresh(void);
 	unsigned draws = 0, clears = 0, blits = 0, gpu = 0;
 	/* copied textures again, with what was written since they were bound */
 	s8_shadow_refresh();
+	/* Per-pass pictures of complex frames (12 passes or more: an app such
+	 * as Settings, not the lock screen; boot diag4's timed snapshots all
+	 * fell on the lock screen): one frame every 10 s at most, 10 frames. */
+	static uint64_t app_next;
+	static unsigned app_n;
+	unsigned app = 0;
+	if (_npasses >= 12 && app_n < 10 && s8_now_ns() >= app_next) {
+		app = 100 + ++app_n;
+		app_next = s8_now_ns() + 10000000000ULL;
+		s8_log("MTL app frame %u: %u passes", app, _npasses);
+	}
 	for (unsigned i = 0; i < _npasses; i++) {
 		struct s8_pass *p = &_passes[i];
 		if (p->kind == 1) {
@@ -362,8 +373,8 @@ void s8_shadow_refresh(void);
 				s8_shot(p->target);
 				/* snapshot frames of an app (8 passes or more): the screen
 				 * after every pass, for the first 6 of them */
-				if (s8_diag_on && s8_diag_bound && _npasses >= 8 && s8_diag_n <= 12)
-					s8_mini(p->target, s8_diag_n, i);
+				if (app)
+					s8_mini(p->target, app, i);
 				/* where the colours go (boot tex1: the display only blue):
 				 * two raw texels of each of the first 80 full-screen
 				 * passes, centre and lower left */
@@ -398,6 +409,14 @@ void s8_shadow_refresh(void);
 		}
 	}
 	s8_draws_total += draws;
+	if (app)
+		for (unsigned i = 0; i < _npasses; i++) {
+			struct s8_pass *p = &_passes[i];
+			S8Texture *tg = p->target;
+			s8_log("MTL app pass %u/%u kind %d gpu %d: %lux%lu f%lu load %lu draws %u", i, _npasses, p->kind, p->gpu,
+			    tg ? (unsigned long)tg->_width : 0, tg ? (unsigned long)tg->_height : 0,
+			    tg ? (unsigned long)tg->_format : 0, (unsigned long)p->load, p->draws);
+		}
 	if (s8_diag()) {
 		for (unsigned i = 0; i < _npasses; i++) {
 			struct s8_pass *p = &_passes[i];
