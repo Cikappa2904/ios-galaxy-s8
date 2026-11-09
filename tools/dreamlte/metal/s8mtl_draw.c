@@ -1878,6 +1878,32 @@ void s8d_draw(struct s8d_cmdbuf *cb, unsigned prim, unsigned start, unsigned cou
 		cfg.samplers = vs_smp;
 	}
 
+	/*
+	 * Every draw of complex frames (10 passes or more: apps), to compare a
+	 * Settings frame whose 54-draw pass drew nothing with a good one (boot
+	 * diag5): pass, pipeline, primitive, counts, index range, the first two
+	 * vertex buffers (GPU address or arena copy, length, first 16 bytes),
+	 * viewport and scissor.
+	 */
+	{
+		static unsigned draw_logged;
+		if (cb->npasses >= 10 && draw_logged < 1200) {
+			draw_logged += 2;
+			struct s8_binding *b0 = &vst->buffers[0], *b1 = &vst->buffers[1];
+			uint32_t w0[4] = { 0 };
+			if (b0->set && b0->cpu && b0->length >= 16)
+				memcpy(w0, b0->cpu, 16);
+			s8_log("MTL draw p%d pl%u prim %u n %u i%u x%u idx %u %s r %u+%u vb0 %llx/%llu vb1 %llx/%llu", cb->current,
+			    pl->id, prim, count, instances, index_size, index_size ? (index_gpu ? 1 : 0) : 0,
+			    index_size ? "gpu" : "-", min_index, vertex_range, (unsigned long long)b0->gpu,
+			    (unsigned long long)b0->length, (unsigned long long)b1->gpu, (unsigned long long)b1->length);
+			s8_log("MTL draw  vp %.0f,%.0f %.0fx%.0f sc %d %u,%u %ux%u v0 %08x %08x %08x %08x",
+			    cb->viewport_set ? cb->viewport[0] : -1.0, cb->viewport_set ? cb->viewport[1] : -1.0,
+			    cb->viewport_set ? cb->viewport[2] : -1.0, cb->viewport_set ? cb->viewport[3] : -1.0, cb->scissor_set,
+			    cb->scissor[0], cb->scissor[1], cb->scissor[2], cb->scissor[3], w0[0], w0[1], w0[2], w0[3]);
+		}
+	}
+
 	/* Tiler job. */
 	unsigned pv;
 	enum mali_draw_mode mode = s8_draw_mode(prim, &pv);
